@@ -259,7 +259,6 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                             predicted_traffic = max(predicted_traffic, 0)
                         
                     # Traffic light adjustment logic
-                    congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
                     new_phases = []
                     
                     for i, phase in enumerate(phases):
@@ -513,17 +512,18 @@ def main_menu():
                 })
                 
                 # Save results
-                adaptive_arima_df.to_csv('adaptive_arima_results.csv', index=False)
-                adaptive_lstm_df.to_csv('adaptive_lstm_results.csv', index=False)
-                fixed_df.to_csv('fixed_results.csv', index=False)
+                adaptive_arima_df.to_csv('Model Data (csv)/data_arima.csv', index= False)
+                adaptive_lstm_df.to_csv('Model Data (csv)/data_lstm.csv', index= False)
+                fixed_df.to_csv('Model Data (csv)/data_fixed.csv', index= False)
                 
                 print("\nGenerating visualizations...")
                 generate_visualizations(adaptive_arima_df, adaptive_lstm_df, fixed_df)
                 
                 if 'predictions' in adaptive_arima_df.columns and 'actual_flows' in adaptive_arima_df.columns:
-                    create_prediction_accuracy_plot(adaptive_arima_df['predictions'], adaptive_arima_df['actual_flows'], 'generate_visualizations/arima_prediction_accuracy.png')
+                    create_prediction_accuracy_plot(adaptive_arima_df['predictions'], adaptive_arima_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_arima.png')
+                
                 if 'predictions' in adaptive_lstm_df.columns and 'actual_flows' in adaptive_lstm_df.columns:
-                    create_prediction_accuracy_plot(adaptive_lstm_df['predictions'], adaptive_lstm_df['actual_flows'], 'generate_visualizations/lstm_prediction_accuracy.png')
+                    create_prediction_accuracy_plot(adaptive_lstm_df['predictions'], adaptive_lstm_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_lstm.png')
                 
                 calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, fixed_df)
                 
@@ -534,9 +534,9 @@ def main_menu():
             print('\nLoading existing simulation data...')
             try:
                 # Load the data
-                adaptive_arima_df = pd.read_csv('adaptive_arima_results.csv')
-                adaptive_lstm_df = pd.read_csv('adaptive_lstm_results.csv')
-                fixed_df = pd.read_csv('fixed_results.csv')
+                adaptive_arima_df = pd.read_csv('Model Data (csv)/data_arima.csv')
+                adaptive_lstm_df = pd.read_csv('Model Data (csv)/data_lstm.csv')
+                fixed_df = pd.read_csv('Model Data (csv)/data_fixed.csv')
                 
                 print("\nGenerating visualizations...")
                 
@@ -545,14 +545,10 @@ def main_menu():
                 
                 # Generate prediction accuracy plots if data exists
                 if 'predictions' in adaptive_arima_df.columns and 'actual_flows' in adaptive_arima_df.columns:
-                    create_prediction_accuracy_plot(adaptive_arima_df['predictions'], 
-                                                 adaptive_arima_df['actual_flows'], 
-                                                 'Generated Visualizations\prediction_accuracy_arima.png')
+                    create_prediction_accuracy_plot(adaptive_arima_df['predictions'], adaptive_arima_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_arima.png')
                 
                 if 'predictions' in adaptive_lstm_df.columns and 'actual_flows' in adaptive_lstm_df.columns:
-                    create_prediction_accuracy_plot(adaptive_lstm_df['predictions'], 
-                                                 adaptive_lstm_df['actual_flows'], 
-                                                 'Generated Visualizations\prediction_accuracy_arima.png')
+                    create_prediction_accuracy_plot(adaptive_lstm_df['predictions'], adaptive_lstm_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_lstm.png')
                 
                 # Calculate and display model comparison
                 calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, fixed_df)

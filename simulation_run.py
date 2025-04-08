@@ -547,12 +547,12 @@ def main_menu():
                 if 'predictions' in adaptive_arima_df.columns and 'actual_flows' in adaptive_arima_df.columns:
                     create_prediction_accuracy_plot(adaptive_arima_df['predictions'], 
                                                  adaptive_arima_df['actual_flows'], 
-                                                 'generate_visualizations/arima_prediction_accuracy.png')
+                                                 'Generated Visualizations\prediction_accuracy_arima.png')
                 
                 if 'predictions' in adaptive_lstm_df.columns and 'actual_flows' in adaptive_lstm_df.columns:
                     create_prediction_accuracy_plot(adaptive_lstm_df['predictions'], 
                                                  adaptive_lstm_df['actual_flows'], 
-                                                 'generate_visualizations/lstm_prediction_accuracy.png')
+                                                 'Generated Visualizations\prediction_accuracy_arima.png')
                 
                 # Calculate and display model comparison
                 calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, fixed_df)

@@ -94,11 +94,11 @@ def generate_visualizations(arima_df, lstm_df, fixed_df):
     axes[1, 1].set_ylim(-20, 100)
     
     plt.tight_layout()
-    plt.savefig(generate_visualizations/'Model_Comparison.png', dpi=300, bbox_inches='tight')
+    plt.savefig('Generated Visualizations\Traffic_Control_Comparison.png', dpi=300, bbox_inches='tight')
     plt.close()
     print('Visualizations generated successfully')
 
-def create_prediction_accuracy_plot(predictions, actual_flows, output_filename='generate_visualizations/prediction_accuracy.png'):
+def create_prediction_accuracy_plot(predictions, actual_flows, output_filename='Generated Visualizations\prediction_accuracy.png'):
     plt.figure(figsize=(14, 8))
     
     x = range(len(predictions))

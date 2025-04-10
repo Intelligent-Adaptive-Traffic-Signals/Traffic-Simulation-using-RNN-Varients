@@ -55,8 +55,6 @@ def create_sequences(data, seq_length):
 
 def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
     # Set fixed seed+1 for non-adaptive to match original code behavior
-    if not use_adaptive_timing:
-        seed = seed + 1
         
     sumoCmd = ['sumo-gui', '-c', 'osm.sumocfg', '--seed', str(seed)]
     traci.start(sumoCmd)
@@ -176,15 +174,15 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
             actual_flow = vehicle_count
             
             if model_type == 'arima':
-                # Default to current flow if prediction fails
-                predicted_traffic = actual_flow
-                
                 try:
-                    transformed_data = np.log1p(time_series_data[-30:])
+                    window_size = 60  # Increased window size
+                    transformed_data = np.log1p(time_series_data[-window_size:])
                     model = ARIMA(transformed_data, order=(1, 1, 1), enforce_stationarity=False, enforce_invertibility=False)
                     model_fit = model.fit()
-                    prediction = np.expm1(model_fit.forecast(steps=5))
-                    predicted_traffic = max(prediction[-1], 0)
+                    prediction = np.expm1(model_fit.forecast(steps=1))
+                    predicted_traffic = max(prediction[0], 0)
+                    predictions.append(predicted_traffic)
+                    actual_flows.append(actual_flow)
                     
                     # Traffic light adjustment logic
                     congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
@@ -223,23 +221,22 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                     traci.trafficlight.setProgramLogic(target_tl, updated_program)
                 except Exception as e:
                     print(f'ARIMA Training Error: {e}')
-                    predicted_traffic = actual_flow
-                
-                # Always record prediction and actual flow, even if model fails
-                predictions.append(predicted_traffic)
-                actual_flows.append(actual_flow)
             
             elif model_type == 'lstm':
-                # Default to current flow if prediction fails
-                predicted_traffic = actual_flow
-                
                 try:
                     if len(time_series_data) >= max(30, seq_length + 5):
-                        if (step % 200 == 0 or lstm_model is None) and step > last_lstm_training_time + 100:
+                        if (step % 200 == 0 or lstm_model is None) and step > last_lstm_training_time + 300:
                             tf.keras.backend.clear_session()
-                            recent_data = time_series_data[-200:] if len(time_series_data) > 200 else time_series_data
-                            data_array = np.array(recent_data).reshape(-1, 1)
-                            normalized_data = scaler.fit_transform(data_array)
+                            # Initialize scaler outside the training loop
+                            scaler = MinMaxScaler(feature_range=(0, 1))
+                            # Initial fit on the first training data
+                            if lstm_model is None:
+                                initial_data = np.array(time_series_data[-200:]).reshape(-1, 1)
+                                scaler.fit(initial_data)
+                            # During retraining, partial fit with new data
+                            new_data = np.array(time_series_data[-200:]).reshape(-1, 1)
+                            scaler.partial_fit(new_data)  # Requires scaler that supports partial_fit
+                            normalized_data = scaler.transform(new_data)
                             
                             X, y = create_sequences(normalized_data, seq_length)
                             
@@ -257,8 +254,15 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                             normalized_prediction = lstm_model.predict(normalized_recent, verbose=0)
                             predicted_traffic = scaler.inverse_transform(normalized_prediction)[0][0]
                             predicted_traffic = max(predicted_traffic, 0)
+                            predictions.append(predicted_traffic)
+                            actual_flows.append(actual_flow)
+                        else:
+                            predicted_traffic = actual_flow
+                    else:
+                        predicted_traffic = actual_flow
                         
-                    # Traffic light adjustment logic
+                    # Use same traffic light timing logic as ARIMA
+                    congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
                     new_phases = []
                     
                     for i, phase in enumerate(phases):
@@ -272,7 +276,7 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                             
                             phase_congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
                             
-                            if phase_congestion > 0.15 or predicted_traffic > 18:
+                            if phase_congestion > 0.1 or predicted_traffic > 20:
                                 new_duration = min(phase.maxDur, phase.duration + 10)
                             else:
                                 new_duration = max(phase.minDur, phase.duration - 5)
@@ -294,30 +298,13 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                     traci.trafficlight.setProgramLogic(target_tl, updated_program)
                 except Exception as e:
                     print(f'LSTM Training Error: {e}')
-                
-                # Always record prediction and actual flow, regardless of model success
-                predictions.append(predicted_traffic)
-                actual_flows.append(actual_flow)
+                    predicted_traffic = actual_flow
     
-    traci.close()  
-    # Ensure predictions and actual_flows are filled for all time steps if needed
-    if use_adaptive_timing and len(predictions) < len(time_stamps):
-        # If we have some predictions but not enough, pad the beginning
-        if len(predictions) > 0:
-            padding_needed = len(time_stamps) - len(predictions)
-            # Use the first prediction value for padding
-            predictions = [predictions[0]] * padding_needed + predictions
-            actual_flows = [actual_flows[0]] * padding_needed + actual_flows
-        else:
-            # If we have no predictions, use zeros
-            predictions = [0] * len(time_stamps)
-            actual_flows = [0] * len(time_stamps)
+    traci.close()
     
     # Ensure all arrays have the same length
     min_length = min(len(time_stamps), len(waiting_times), len(queue_lengths), len(travel_times))
-    
-    # Include predictions and actual flows in min_length calculation only if they exist
-    if use_adaptive_timing and len(predictions) > 0 and len(actual_flows) > 0:
+    if len(predictions) > 0 and len(actual_flows) > 0:
         min_length = min(min_length, len(predictions), len(actual_flows))
     
     results = {
@@ -325,13 +312,13 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
         'waiting_time': waiting_times[:min_length],
         'queue_length': queue_lengths[:min_length],
         'travel_time': travel_times[:min_length],
-        'predictions': predictions[:min_length] if len(predictions) > 0 else [],
-        'actual_flows': actual_flows[:min_length] if len(actual_flows) > 0 else [],
+        'predictions': predictions[:min_length] if predictions else [],
+        'actual_flows': actual_flows[:min_length] if actual_flows else [],
         'lane_densities': lane_densities,
         'model_type': model_type
     }
     
-    return results
+    return results;
 
 def calculate_and_print_metrics(adaptive_df, fixed_df, model_type='ARIMA'):
     # Calculate metrics using rolling windows like in first code for similar results
@@ -442,20 +429,15 @@ def calculate_model_comparison(arima_df, lstm_df, fixed_df):
     print(f'Travel Time     | {arima_travel_improvement:>6.1f}% | {lstm_travel_improvement:>6.1f}% |')
     print('--------------------------------')
     
-    # Check if prediction data exists and has equal length
     if ('predictions' in arima_df.columns and 'actual_flows' in arima_df.columns and
         'predictions' in lstm_df.columns and 'actual_flows' in lstm_df.columns):
         
-        # Ensure we have data to compare
-        if (len(arima_df['predictions']) > 0 and len(lstm_df['predictions']) > 0 and
-            len(arima_df['actual_flows']) > 0 and len(lstm_df['actual_flows']) > 0):
-            
-            arima_pred = np.array(arima_df['predictions'])
-            arima_actual = np.array(arima_df['actual_flows'])
-            lstm_pred = np.array(lstm_df['predictions'])
-            lstm_actual = np.array(lstm_df['actual_flows'])
-            
-            # Calculate metrics
+        arima_pred = np.array(arima_df['predictions'])
+        arima_actual = np.array(arima_df['actual_flows'])
+        lstm_pred = np.array(lstm_df['predictions'])
+        lstm_actual = np.array(lstm_df['actual_flows'])
+        
+        if len(arima_pred) > 0 and len(lstm_pred) > 0:
             arima_mae = np.mean(np.abs(arima_pred - arima_actual))
             lstm_mae = np.mean(np.abs(lstm_pred - lstm_actual))
             
@@ -464,8 +446,7 @@ def calculate_model_comparison(arima_df, lstm_df, fixed_df):
             print(f'ARIMA: {arima_mae:.2f} vehicles')
             print(f'LSTM:  {lstm_mae:.2f} vehicles')
             print('--------------------------------')
-        else:
-            print("\nWarning: Missing prediction data for comparison")
+
 
 def main_menu():
     while True:
@@ -512,16 +493,15 @@ def main_menu():
                 })
                 
                 # Save results
-                adaptive_arima_df.to_csv('Model Data (csv)/data_arima.csv', index= False)
-                adaptive_lstm_df.to_csv('Model Data (csv)/data_lstm.csv', index= False)
-                fixed_df.to_csv('Model Data (csv)/data_fixed.csv', index= False)
+                adaptive_arima_df.to_csv('Model Data (csv)/data_arima.csv', index=False)
+                adaptive_lstm_df.to_csv('Model Data (csv)/data_lstm.csv', index=False)
+                fixed_df.to_csv('Model Data (csv)/data_fixed.csv', index=False)
                 
                 print("\nGenerating visualizations...")
                 generate_visualizations(adaptive_arima_df, adaptive_lstm_df, fixed_df)
                 
                 if 'predictions' in adaptive_arima_df.columns and 'actual_flows' in adaptive_arima_df.columns:
                     create_prediction_accuracy_plot(adaptive_arima_df['predictions'], adaptive_arima_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_arima.png')
-                
                 if 'predictions' in adaptive_lstm_df.columns and 'actual_flows' in adaptive_lstm_df.columns:
                     create_prediction_accuracy_plot(adaptive_lstm_df['predictions'], adaptive_lstm_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_lstm.png')
                 
@@ -542,7 +522,7 @@ def main_menu():
                 
                 # Generate main comparison visualization
                 generate_visualizations(adaptive_arima_df, adaptive_lstm_df, fixed_df)
-                
+                              
                 # Generate prediction accuracy plots if data exists
                 if 'predictions' in adaptive_arima_df.columns and 'actual_flows' in adaptive_arima_df.columns:
                     create_prediction_accuracy_plot(adaptive_arima_df['predictions'], adaptive_arima_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_arima.png')

@@ -128,7 +128,6 @@ def run_simulation(use_adaptive_timing=True, seed=42):
                 actual_flows.append(actual_flow)
                 
                 print(f'Predicted Traffic Flow: {predicted_traffic:.2f}, Actual: {actual_flow}')
-                congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
                 new_phases = []
                 
                 for i, phase in enumerate(phases):

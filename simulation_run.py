@@ -9,7 +9,7 @@ from statsmodels.tsa.arima.model import ARIMA
 from sumolib.net import Phase
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM, Input
+from tensorflow.keras.layers import Dense, LSTM, Input, Bidirectional  # NEW
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
 from visualization import generate_visualizations, create_prediction_accuracy_plot
@@ -39,6 +39,17 @@ def create_lstm_model(seq_length):
     model = Sequential([
         Input(shape=(seq_length, 1)),
         LSTM(32, activation='relu'),
+        Dense(8, activation='relu'),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+# NEW Bi-LSTM model creation
+def create_bilstm_model(seq_length):
+    model = Sequential([
+        Input(shape=(seq_length, 1)),
+        Bidirectional(LSTM(32, activation='relu')),  # Modified line
         Dense(8, activation='relu'),
         Dense(1)
     ])
@@ -95,11 +106,11 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
     incoming_lanes = []
     completed_travel_times = []
     
-    # LSTM specific setup
-    lstm_model = None
+    # Model setup
+    model = None  # Changed to generic model variable
     scaler = MinMaxScaler(feature_range=(0, 1))
     seq_length = 10
-    last_lstm_training_time = 0
+    last_training_time = 0
     
     # Get incoming lanes
     for link_index in range(traci.trafficlight.getRedYellowGreenState(target_tl).count('G')):
@@ -172,7 +183,7 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
         
         # Adaptive timing logic
         if use_adaptive_timing and len(time_series_data) > 30 and step % 5 == 0:
-            step_actual_flow = vehicle_count
+            step_actual_flow = vehicle_count if vehicle_count > 0 else 0.001
             
             if model_type == 'arima':
                 try:
@@ -221,14 +232,15 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                     
                 except Exception as e:
                     print(f'ARIMA Error: {e}')
-                    step_prediction = current_prediction  # Maintain previous prediction on error
+                    step_prediction = current_prediction
             
-            elif model_type == 'lstm':
+            # NEW: Added Bi-LSTM model handling
+            elif model_type in ['lstm', 'bilstm']:
                 try:
                     if len(time_series_data) >= max(30, seq_length + 5):
-                        if (step % 200 == 0 or lstm_model is None) and step > last_lstm_training_time + 100:
+                        if (step % 100 == 0 or model is None) and len(time_series_data) >= seq_length + 5:
                             tf.keras.backend.clear_session()
-                            new_data = np.array(time_series_data[-200:]).reshape(-1, 1)
+                            new_data = np.array(time_series_data).reshape(-1, 1)
                             scaler.fit(new_data)
                             normalized_data = scaler.transform(new_data)
                             
@@ -236,17 +248,21 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                             
                             if len(X) > 0 and len(y) > 0:
                                 early_stopping = EarlyStopping(monitor='loss', patience=3)
-                                lstm_model = create_lstm_model(seq_length)
-                                lstm_model.fit(X, y, epochs=5, batch_size=16, 
-                                             verbose=0, callbacks=[early_stopping])
-                                last_lstm_training_time = step
+                                # Choose model based on type
+                                if model_type == 'lstm':
+                                    model = create_lstm_model(seq_length)
+                                else:
+                                    model = create_bilstm_model(seq_length)
+                                model.fit(X, y, epochs=5, batch_size=16, 
+                                         verbose=0, callbacks=[early_stopping])
+                                last_training_time = step
                         
-                        if lstm_model is not None and len(time_series_data) >= seq_length:
+                        if model is not None and len(time_series_data) >= seq_length:
                             recent_data = np.array(time_series_data[-seq_length:]).reshape(-1, 1)
                             normalized_recent = scaler.transform(recent_data)
                             normalized_recent = normalized_recent.reshape(1, seq_length, 1)
                             
-                            normalized_prediction = lstm_model.predict(normalized_recent, verbose=0)
+                            normalized_prediction = model.predict(normalized_recent, verbose=0)
                             step_prediction = scaler.inverse_transform(normalized_prediction)[0][0]
                             step_prediction = max(step_prediction, 0)
                         else:
@@ -290,14 +306,14 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                     traci.trafficlight.setProgramLogic(target_tl, updated_program)
                     
                 except Exception as e:
-                    print(f'LSTM Error: {e}')
-                    step_prediction = current_prediction  # Maintain previous prediction on error
+                    print(f'{model_type.upper()} Error: {e}')
+                    step_prediction = current_prediction
             
             # Update tracking variables
             current_prediction = step_prediction
             last_actual_flow = step_actual_flow
         
-        # Append values for this step (always happens)
+        # Append values for this step
         predictions.append(current_prediction)
         actual_flows.append(last_actual_flow)
     
@@ -326,9 +342,7 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
     
     return results
 
-# ... [rest of the code with calculate_and_print_metrics, calculate_model_comparison, and main_menu remains unchanged]
 def calculate_and_print_metrics(adaptive_df, fixed_df, model_type='ARIMA'):
-    # Calculate metrics using rolling windows like in first code for similar results
     window = 30
     adaptive_wait_smooth = adaptive_df['waiting_time'].rolling(window=window).mean().fillna(adaptive_df['waiting_time'])
     fixed_wait_smooth = fixed_df['waiting_time'].rolling(window=window).mean().fillna(fixed_df['waiting_time'])
@@ -383,77 +397,91 @@ def calculate_and_print_metrics(adaptive_df, fixed_df, model_type='ARIMA'):
             print(f'Mean Absolute Error (MAE) = {mae:.2f}')
             print(f'Mean Absolute Percentage Error (MAPE) = {mape:.2f}%')
 
-def calculate_model_comparison(arima_df, lstm_df, fixed_df):
-    # Apply similar window smoothing as in first code
+def calculate_model_comparison(arima_df, lstm_df, bilstm_df, fixed_df):  # Modified
+    # Apply similar window smoothing
     window = 30
     arima_wait_smooth = arima_df['waiting_time'].rolling(window=window).mean().fillna(arima_df['waiting_time'])
     lstm_wait_smooth = lstm_df['waiting_time'].rolling(window=window).mean().fillna(lstm_df['waiting_time'])
+    bilstm_wait_smooth = bilstm_df['waiting_time'].rolling(window=window).mean().fillna(bilstm_df['waiting_time'])  # NEW
     fixed_wait_smooth = fixed_df['waiting_time'].rolling(window=window).mean().fillna(fixed_df['waiting_time'])
     
     arima_queue_smooth = arima_df['queue_length'].rolling(window=window).mean().fillna(arima_df['queue_length'])
     lstm_queue_smooth = lstm_df['queue_length'].rolling(window=window).mean().fillna(lstm_df['queue_length'])
+    bilstm_queue_smooth = bilstm_df['queue_length'].rolling(window=window).mean().fillna(bilstm_df['queue_length'])  # NEW
     fixed_queue_smooth = fixed_df['queue_length'].rolling(window=window).mean().fillna(fixed_df['queue_length'])
     
     arima_travel_smooth = arima_df['travel_time'].rolling(window=window).mean().fillna(arima_df['travel_time'])
     lstm_travel_smooth = lstm_df['travel_time'].rolling(window=window).mean().fillna(lstm_df['travel_time'])
+    bilstm_travel_smooth = bilstm_df['travel_time'].rolling(window=window).mean().fillna(bilstm_df['travel_time'])  # NEW
     fixed_travel_smooth = fixed_df['travel_time'].rolling(window=window).mean().fillna(fixed_df['travel_time'])
     
     print('\n===== PERFORMANCE COMPARISON =====')
     
     arima_wait = np.mean(arima_wait_smooth)
     lstm_wait = np.mean(lstm_wait_smooth)
+    bilstm_wait = np.mean(bilstm_wait_smooth)  # NEW
     fixed_wait = np.mean(fixed_wait_smooth)
     
     arima_queue = np.mean(arima_queue_smooth)
     lstm_queue = np.mean(lstm_queue_smooth)
+    bilstm_queue = np.mean(bilstm_queue_smooth)  # NEW
     fixed_queue = np.mean(fixed_queue_smooth)
     
     arima_travel = np.mean(arima_travel_smooth)
     lstm_travel = np.mean(lstm_travel_smooth)
+    bilstm_travel = np.mean(bilstm_travel_smooth)  # NEW
     fixed_travel = np.mean(fixed_travel_smooth)
     
     print('--- Calculated Averages (30-step rolling window) ---')
-    print(f'ARIMA Wait: {arima_wait:.2f}, LSTM Wait: {lstm_wait:.2f}, Fixed Wait: {fixed_wait:.2f}')
-    print(f'ARIMA Queue: {arima_queue:.2f}, LSTM Queue: {lstm_queue:.2f}, Fixed Queue: {fixed_queue:.2f}')
-    print(f'ARIMA Travel: {arima_travel:.2f}, LSTM Travel: {lstm_travel:.2f}, Fixed Travel: {fixed_travel:.2f}')
+    print(f'ARIMA Wait: {arima_wait:.2f}, LSTM Wait: {lstm_wait:.2f}, Bi-LSTM Wait: {bilstm_wait:.2f}, Fixed Wait: {fixed_wait:.2f}')  # Modified
+    print(f'ARIMA Queue: {arima_queue:.2f}, LSTM Queue: {lstm_queue:.2f}, Bi-LSTM Queue: {bilstm_queue:.2f}, Fixed Queue: {fixed_queue:.2f}')  # Modified
+    print(f'ARIMA Travel: {arima_travel:.2f}, LSTM Travel: {lstm_travel:.2f}, Bi-LSTM Travel: {bilstm_travel:.2f}, Fixed Travel: {fixed_travel:.2f}')  # Modified
     print('--------------------------------------------------')
     
     arima_wait_improvement = ((fixed_wait - arima_wait) / fixed_wait * 100) if fixed_wait > 0 else 0
     lstm_wait_improvement = ((fixed_wait - lstm_wait) / fixed_wait * 100) if fixed_wait > 0 else 0
+    bilstm_wait_improvement = ((fixed_wait - bilstm_wait) / fixed_wait * 100) if fixed_wait > 0 else 0  # NEW
     
     arima_queue_improvement = ((fixed_queue - arima_queue) / fixed_queue * 100) if fixed_queue > 0 else 0
     lstm_queue_improvement = ((fixed_queue - lstm_queue) / fixed_queue * 100) if fixed_queue > 0 else 0
+    bilstm_queue_improvement = ((fixed_queue - bilstm_queue) / fixed_queue * 100) if fixed_queue > 0 else 0  # NEW
     
     arima_travel_improvement = ((fixed_travel - arima_travel) / fixed_travel * 100) if fixed_travel > 0 else 0
     lstm_travel_improvement = ((fixed_travel - lstm_travel) / fixed_travel * 100) if fixed_travel > 0 else 0
+    bilstm_travel_improvement = ((fixed_travel - bilstm_travel) / fixed_travel * 100) if fixed_travel > 0 else 0  # NEW
     
     print('\nImprovement over Fixed Timing:')
     print('--------------------------------')
-    print('Metric           | ARIMA   | LSTM    |')
+    print('Metric           | ARIMA   | LSTM    | Bi-LSTM |')  # Modified
     print('--------------------------------')
-    print(f'Waiting Time    | {arima_wait_improvement:>6.1f}% | {lstm_wait_improvement:>6.1f}% |')
-    print(f'Queue Length    | {arima_queue_improvement:>6.1f}% | {lstm_queue_improvement:>6.1f}% |')
-    print(f'Travel Time     | {arima_travel_improvement:>6.1f}% | {lstm_travel_improvement:>6.1f}% |')
+    print(f'Waiting Time    | {arima_wait_improvement:>6.1f}% | {lstm_wait_improvement:>6.1f}% | {bilstm_wait_improvement:>6.1f}% |')  # Modified
+    print(f'Queue Length    | {arima_queue_improvement:>6.1f}% | {lstm_queue_improvement:>6.1f}% | {bilstm_queue_improvement:>6.1f}% |')  # Modified
+    print(f'Travel Time     | {arima_travel_improvement:>6.1f}% | {lstm_travel_improvement:>6.1f}% | {bilstm_travel_improvement:>6.1f}% |')  # Modified
     print('--------------------------------')
     
+    # Prediction metrics comparison
     if ('predictions' in arima_df.columns and 'actual_flows' in arima_df.columns and
-        'predictions' in lstm_df.columns and 'actual_flows' in lstm_df.columns):
+        'predictions' in lstm_df.columns and 'actual_flows' in lstm_df.columns and
+        'predictions' in bilstm_df.columns and 'actual_flows' in bilstm_df.columns):  # Modified
         
         arima_pred = np.array(arima_df['predictions'])
         arima_actual = np.array(arima_df['actual_flows'])
         lstm_pred = np.array(lstm_df['predictions'])
         lstm_actual = np.array(lstm_df['actual_flows'])
+        bilstm_pred = np.array(bilstm_df['predictions'])  # NEW
+        bilstm_actual = np.array(bilstm_df['actual_flows'])  # NEW
         
-        if len(arima_pred) > 0 and len(lstm_pred) > 0:
+        if len(arima_pred) > 0 and len(lstm_pred) > 0 and len(bilstm_pred) > 0:  # Modified
             arima_mae = np.mean(np.abs(arima_pred - arima_actual))
             lstm_mae = np.mean(np.abs(lstm_pred - lstm_actual))
+            bilstm_mae = np.mean(np.abs(bilstm_pred - bilstm_actual))  # NEW
             
             print('\nPrediction Accuracy (MAE):')
             print('--------------------------------')
-            print(f'ARIMA: {arima_mae:.2f} vehicles')
-            print(f'LSTM:  {lstm_mae:.2f} vehicles')
+            print(f'ARIMA:    {arima_mae:.2f} vehicles')
+            print(f'LSTM:     {lstm_mae:.2f} vehicles')
+            print(f'Bi-LSTM:  {bilstm_mae:.2f} vehicles')  # NEW
             print('--------------------------------')
-
 
 def main_menu():
     while True:
@@ -467,13 +495,14 @@ def main_menu():
         if choice == '1':
             print('\nRunning simulations with multiple models...')
             
-            # Run all simulations sequentially using the same seed for a fair comparison
-            adaptive_arima_results = run_simulation(use_adaptive_timing=True, model_type='arima', seed=42)
-            adaptive_lstm_results = run_simulation(use_adaptive_timing=True, model_type='lstm', seed=42)
-            fixed_results = run_simulation(use_adaptive_timing=False, model_type='fixed', seed=42)
+            # Run all simulations
+            adaptive_arima_results = run_simulation(model_type='arima', seed=42)
+            adaptive_lstm_results = run_simulation(model_type='lstm', seed=42)
+            adaptive_bilstm_results = run_simulation(model_type='bilstm', seed=42)  # NEW
+            fixed_results = run_simulation(use_adaptive_timing=False, seed=42)
             
-            if adaptive_arima_results and adaptive_lstm_results and fixed_results:
-                # Create DataFrames with all available data
+            if all([adaptive_arima_results, adaptive_lstm_results, adaptive_bilstm_results, fixed_results]):  # Modified
+                # Create DataFrames
                 adaptive_arima_df = pd.DataFrame({
                     'timestamp': adaptive_arima_results['timestamp'],
                     'waiting_time': adaptive_arima_results['waiting_time'],
@@ -492,6 +521,16 @@ def main_menu():
                     'actual_flows': adaptive_lstm_results.get('actual_flows', [])
                 })
                 
+                # NEW: Bi-LSTM DataFrame
+                adaptive_bilstm_df = pd.DataFrame({
+                    'timestamp': adaptive_bilstm_results['timestamp'],
+                    'waiting_time': adaptive_bilstm_results['waiting_time'],
+                    'queue_length': adaptive_bilstm_results['queue_length'],
+                    'travel_time': adaptive_bilstm_results['travel_time'],
+                    'predictions': adaptive_bilstm_results.get('predictions', []),
+                    'actual_flows': adaptive_bilstm_results.get('actual_flows', [])
+                })
+                
                 fixed_df = pd.DataFrame({
                     'timestamp': fixed_results['timestamp'],
                     'waiting_time': fixed_results['waiting_time'],
@@ -502,17 +541,34 @@ def main_menu():
                 # Save results
                 adaptive_arima_df.to_csv('Model Data (csv)/data_arima.csv', index=False)
                 adaptive_lstm_df.to_csv('Model Data (csv)/data_lstm.csv', index=False)
+                adaptive_bilstm_df.to_csv('Model Data (csv)/data_bilstm.csv', index=False)  # NEW
                 fixed_df.to_csv('Model Data (csv)/data_fixed.csv', index=False)
                 
                 print("\nGenerating visualizations...")
-                generate_visualizations(adaptive_arima_df, adaptive_lstm_df, fixed_df)
+                generate_visualizations(adaptive_arima_df, adaptive_lstm_df, adaptive_bilstm_df, fixed_df)  # Modified
                 
-                if 'predictions' in adaptive_arima_df.columns and 'actual_flows' in adaptive_arima_df.columns:
-                    create_prediction_accuracy_plot(adaptive_arima_df['predictions'], adaptive_arima_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_arima.png')
-                if 'predictions' in adaptive_lstm_df.columns and 'actual_flows' in adaptive_lstm_df.columns:
-                    create_prediction_accuracy_plot(adaptive_lstm_df['predictions'], adaptive_lstm_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_lstm.png')
+                # Generate prediction plots
+                if 'predictions' in adaptive_arima_df.columns:
+                    create_prediction_accuracy_plot(
+                        adaptive_arima_df['predictions'], 
+                        adaptive_arima_df['actual_flows'], 
+                        'Generated Visualizations/prediction_accuracy_arima.png'
+                    )
+                if 'predictions' in adaptive_lstm_df.columns:
+                    create_prediction_accuracy_plot(
+                        adaptive_lstm_df['predictions'], 
+                        adaptive_lstm_df['actual_flows'], 
+                        'Generated Visualizations/prediction_accuracy_lstm.png'
+                    )
+                # NEW: Bi-LSTM prediction plot
+                if 'predictions' in adaptive_bilstm_df.columns:
+                    create_prediction_accuracy_plot(
+                        adaptive_bilstm_df['predictions'], 
+                        adaptive_bilstm_df['actual_flows'], 
+                        'Generated Visualizations/prediction_accuracy_bilstm.png'
+                    )
                 
-                calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, fixed_df)
+                calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, adaptive_bilstm_df, fixed_df)  # Modified
                 
             else:
                 print('Error: One or more simulations failed to complete.')
@@ -523,22 +579,34 @@ def main_menu():
                 # Load the data
                 adaptive_arima_df = pd.read_csv('Model Data (csv)/data_arima.csv')
                 adaptive_lstm_df = pd.read_csv('Model Data (csv)/data_lstm.csv')
+                adaptive_bilstm_df = pd.read_csv('Model Data (csv)/data_bilstm.csv')  # NEW
                 fixed_df = pd.read_csv('Model Data (csv)/data_fixed.csv')
                 
                 print("\nGenerating visualizations...")
-                
-                # Generate main comparison visualization
-                generate_visualizations(adaptive_arima_df, adaptive_lstm_df, fixed_df)
+                generate_visualizations(adaptive_arima_df, adaptive_lstm_df, adaptive_bilstm_df, fixed_df)  # Modified
                               
-                # Generate prediction accuracy plots if data exists
-                if 'predictions' in adaptive_arima_df.columns and 'actual_flows' in adaptive_arima_df.columns:
-                    create_prediction_accuracy_plot(adaptive_arima_df['predictions'], adaptive_arima_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_arima.png')
+                # Generate prediction plots
+                if 'predictions' in adaptive_arima_df.columns:
+                    create_prediction_accuracy_plot(
+                        adaptive_arima_df['predictions'], 
+                        adaptive_arima_df['actual_flows'], 
+                        'Generated Visualizations/prediction_accuracy_arima.png'
+                    )
+                if 'predictions' in adaptive_lstm_df.columns:
+                    create_prediction_accuracy_plot(
+                        adaptive_lstm_df['predictions'], 
+                        adaptive_lstm_df['actual_flows'], 
+                        'Generated Visualizations/prediction_accuracy_lstm.png'
+                    )
+                # NEW: Bi-LSTM prediction plot
+                if 'predictions' in adaptive_bilstm_df.columns:
+                    create_prediction_accuracy_plot(
+                        adaptive_bilstm_df['predictions'], 
+                        adaptive_bilstm_df['actual_flows'], 
+                        'Generated Visualizations/prediction_accuracy_bilstm.png'
+                    )
                 
-                if 'predictions' in adaptive_lstm_df.columns and 'actual_flows' in adaptive_lstm_df.columns:
-                    create_prediction_accuracy_plot(adaptive_lstm_df['predictions'], adaptive_lstm_df['actual_flows'], 'Generated Visualizations/prediction_accuracy_lstm.png')
-                
-                # Calculate and display model comparison
-                calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, fixed_df)
+                calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, adaptive_bilstm_df, fixed_df)  # Modified
                 
             except FileNotFoundError as e:
                 print(f'Error: Could not find simulation results files. Please run new simulations first.')

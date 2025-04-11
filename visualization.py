@@ -1,159 +1,115 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
-def generate_visualizations(arima_df, lstm_df, bilstm_df, fixed_df):
-    # Align data lengths first
-    min_length = min(len(arima_df), len(lstm_df), len(bilstm_df), len(fixed_df))
-    arima_df = arima_df.iloc[:min_length]
-    lstm_df = lstm_df.iloc[:min_length]
-    bilstm_df = bilstm_df.iloc[:min_length]
-    fixed_df = fixed_df.iloc[:min_length]
-    
-    plt.style.use('bmh')
-    fig, axes = plt.subplots(2, 2, figsize=(20, 12))
-    fig.suptitle('Traffic Control System Comparison', fontsize=16, y=0.95)
-    
+plt.style.use('seaborn-v0_8-darkgrid')
+
+def generate_visualizations(arima, lstm, bilstm, gru, bigru, fixed):
+    # Style configuration
     colors = {
-        'arima': '#590942', 
-        'lstm': '#3498db', 
-        'bilstm': '#2ecc71',  # New color for Bi-LSTM
-        'fixed': '#e74c3c'
+        'arima': '#1f77b4',   # Blue
+        'lstm': '#ff7f0e',    # Orange
+        'bilstm': '#2ca02c',  # Green
+        'gru': '#d62728',     # Red
+        'bigru': '#9467bd',   # Purple
+        'fixed': '#7f7f7f'    # Gray
     }
+    
     line_styles = {
-        'arima': '-', 
-        'lstm': '--', 
-        'bilstm': '-.',  # New line style for Bi-LSTM
-        'fixed': ':'
+        'arima': (0, (1, 1)),
+        'lstm': (0, (5, 5)),
+        'bilstm': (0, (3, 5, 1, 5)),
+        'gru': (0, (5, 1)),
+        'bigru': (0, (3, 1, 1, 1)),
+        'fixed': (0, ())
     }
-    
-    def style_axis(ax, title, xlabel, ylabel):
-        ax.set_title(title, pad=20, fontsize=14)
-        ax.set_xlabel(xlabel, fontsize=12)
-        ax.set_ylabel(ylabel, fontsize=12)
-        ax.tick_params(labelsize=10)
-        ax.legend(fontsize=12, loc='best')
-        ax.grid(True, linestyle=':', alpha=0.6)
-    
-    window = 30
-    
-    # Waiting Time Plot
-    axes[0, 0].plot(arima_df.index, arima_df['waiting_time'].rolling(window).mean(), 
-                      color=colors['arima'], linestyle=line_styles['arima'], 
-                      linewidth=2, label='ARIMA Adaptive')
-    axes[0, 0].plot(lstm_df.index, lstm_df['waiting_time'].rolling(window).mean(),
-                      color=colors['lstm'], linestyle=line_styles['lstm'],
-                      linewidth=2, label='LSTM Adaptive')
-    axes[0, 0].plot(bilstm_df.index, bilstm_df['waiting_time'].rolling(window).mean(),
-                      color=colors['bilstm'], linestyle=line_styles['bilstm'],
-                      linewidth=2, label='Bi-LSTM Adaptive')
-    axes[0, 0].plot(fixed_df.index, fixed_df['waiting_time'].rolling(window).mean(),
-                      color=colors['fixed'], linestyle=line_styles['fixed'],
-                      linewidth=2, label='Fixed Timing')
-    style_axis(axes[0, 0], 'Average Waiting Time\n(30-step rolling average)',
-               'Simulation Step', 'Waiting Time (seconds)')
-    
-    # Queue Length Plot
-    axes[0, 1].plot(arima_df.index, arima_df['queue_length'].rolling(window).mean(), 
-                      color=colors['arima'], linestyle=line_styles['arima'],
-                      linewidth=2, label='ARIMA Adaptive')
-    axes[0, 1].plot(lstm_df.index, lstm_df['queue_length'].rolling(window).mean(),
-                      color=colors['lstm'], linestyle=line_styles['lstm'],
-                      linewidth=2, label='LSTM Adaptive')
-    axes[0, 1].plot(bilstm_df.index, bilstm_df['queue_length'].rolling(window).mean(),
-                      color=colors['bilstm'], linestyle=line_styles['bilstm'],
-                      linewidth=2, label='Bi-LSTM Adaptive')
-    axes[0, 1].plot(fixed_df.index, fixed_df['queue_length'].rolling(window).mean(),
-                      color=colors['fixed'], linestyle=line_styles['fixed'],
-                      linewidth=2, label='Fixed Timing')
-    style_axis(axes[0, 1], 'Queue Length\n(30-step rolling average)',
-               'Simulation Step', 'Number of Vehicles')
-    
-    # Travel Time Plot
-    axes[1, 0].plot(arima_df.index, arima_df['travel_time'].rolling(window).mean(),
-                      color=colors['arima'], linestyle=line_styles['arima'],
-                      linewidth=2, label='ARIMA Adaptive')
-    axes[1, 0].plot(lstm_df.index, lstm_df['travel_time'].rolling(window).mean(),
-                      color=colors['lstm'], linestyle=line_styles['lstm'],
-                      linewidth=2, label='LSTM Adaptive')
-    axes[1, 0].plot(bilstm_df.index, bilstm_df['travel_time'].rolling(window).mean(),
-                      color=colors['bilstm'], linestyle=line_styles['bilstm'],
-                      linewidth=2, label='Bi-LSTM Adaptive')
-    axes[1, 0].plot(fixed_df.index, fixed_df['travel_time'].rolling(window).mean(),
-                      color=colors['fixed'], linestyle=line_styles['fixed'],
-                      linewidth=2, label='Fixed Timing')
-    style_axis(axes[1, 0], 'Travel Time\n(30-step rolling average)',
-               'Simulation Step', 'Travel Time (seconds)')
-    
-    # Improvement Comparison Plot
-    axes[1, 1].remove()
-    axes[1, 1] = fig.add_subplot(224)
-    
-    def safe_improvement(adaptive, fixed):
-        with np.errstate(divide='ignore', invalid='ignore'):
-            improvement = np.where(fixed > 0, (fixed - adaptive) / fixed * 100, 0)
-        return np.nan_to_num(np.clip(improvement, -100, 100))
-    
-    arima_wait_imp = safe_improvement(arima_df['waiting_time'], fixed_df['waiting_time'])
-    lstm_wait_imp = safe_improvement(lstm_df['waiting_time'], fixed_df['waiting_time'])
-    bilstm_wait_imp = safe_improvement(bilstm_df['waiting_time'], fixed_df['waiting_time'])
-    
-    arima_queue_imp = safe_improvement(arima_df['queue_length'], fixed_df['queue_length'])
-    lstm_queue_imp = safe_improvement(lstm_df['queue_length'], fixed_df['queue_length'])
-    bilstm_queue_imp = safe_improvement(bilstm_df['queue_length'], fixed_df['queue_length'])
-    
-    arima_travel_imp = safe_improvement(arima_df['travel_time'], fixed_df['travel_time'])
-    lstm_travel_imp = safe_improvement(lstm_df['travel_time'], fixed_df['travel_time'])
-    bilstm_travel_imp = safe_improvement(bilstm_df['travel_time'], fixed_df['travel_time'])
-    
-    # Plot improvements
-    for model, color in [('arima', colors['arima']), ('lstm', colors['lstm']), ('bilstm', colors['bilstm'])]:
-        axes[1, 1].plot(eval(f"{model}_wait_imp"), color=color, linestyle='-', 
-                        label=f'{model.upper()} Wait' if model != 'bilstm' else 'Bi-LSTM Wait')
-        axes[1, 1].plot(eval(f"{model}_queue_imp"), color=color, linestyle='--', 
-                        label=f'{model.upper()} Queue' if model != 'bilstm' else 'Bi-LSTM Queue')
-        axes[1, 1].plot(eval(f"{model}_travel_imp"), color=color, linestyle=':', 
-                        label=f'{model.upper()} Travel' if model != 'bilstm' else 'Bi-LSTM Travel')
-    
-    axes[1, 1].axhline(0, color='black', linestyle='--', alpha=0.3)
-    style_axis(axes[1, 1], 'Percentage Improvement vs Fixed Timing',
-               'Simulation Step', 'Improvement (%)')
-    axes[1, 1].set_ylim(-20, 100)
-    
-    # Simplify legend
-    handles, labels = axes[1, 1].get_legend_handles_labels()
-    unique_labels = list(dict.fromkeys(labels))  # Preserve order
-    axes[1, 1].legend(handles[:len(unique_labels)], unique_labels, 
-                     fontsize=10, ncol=2, loc='upper center')
-    
-    plt.tight_layout()
-    plt.savefig('Generated Visualizations/Traffic_Control_Comparison.png', dpi=300, bbox_inches='tight')
-    plt.close()
-    print('Visualizations generated successfully')
 
-def create_prediction_accuracy_plot(predictions, actual_flows, output_filename='Generated Visualizations/prediction_accuracy.png'):
-    plt.figure(figsize=(14, 8))
+    # Create figure
+    fig, axs = plt.subplots(3, 2, figsize=(20, 18))
+    fig.suptitle('Traffic Control Model Performance Comparison', y=0.99, fontsize=16)
     
-    x = range(len(predictions))
-    plt.plot(x, predictions, 'b-', label='Predicted Traffic Flow', linewidth=2)
-    plt.plot(x, actual_flows, 'r-', label='Actual Traffic Flow', linewidth=2)
+    # Plotting function
+    def plot_metric(ax, metric, title, ylabel):
+        window = 30
+        for model, df in models.items():
+            if model == 'fixed': 
+                alpha = 0.7
+                lw = 1.5
+            else:
+                alpha = 0.9
+                lw = 2
+            ax.plot(df['timestamp'], df[metric].rolling(window).mean(),
+                    color=colors[model], 
+                    linestyle=line_styles[model],
+                    lw=lw,
+                    alpha=alpha,
+                    label=model.upper())
+        ax.set_title(title, fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.tick_params(axis='x', rotation=45, labelsize=8)
+        ax.tick_params(axis='y', labelsize=8)
+        ax.grid(True, alpha=0.3)
+
+    # Plot metrics
+    models = {'arima': arima, 'lstm': lstm, 'bilstm': bilstm, 
+             'gru': gru, 'bigru': bigru, 'fixed': fixed}
     
-    errors = np.array(predictions) - np.array(actual_flows)
-    mae = np.mean(np.abs(errors))
-    mape = np.mean(np.abs(errors / np.array(actual_flows))) * 100 if np.any(actual_flows) else 0
+    plot_metric(axs[0,0], 'waiting_time', 'Waiting Time Comparison', 'Seconds')
+    plot_metric(axs[0,1], 'queue_length', 'Queue Length Comparison', 'Vehicles')
+    plot_metric(axs[1,0], 'travel_time', 'Travel Time Comparison', 'Seconds')
     
-    plt.title(f'Prediction Accuracy - MAE: {mae:.2f}, MAPE: {mape:.2f}%', fontsize=16)
-    plt.xlabel('Prediction Interval', fontsize=12)
-    plt.ylabel('Vehicle Count', fontsize=12)
-    plt.legend(fontsize=12)
-    plt.grid(True, linestyle=':', alpha=0.6)
+    # Improvement plot
+    ax = axs[1,1]
+    window = 60
+    for model in ['arima', 'lstm', 'bilstm', 'gru', 'bigru']:
+        improvement = ((fixed['waiting_time'] - models[model]['waiting_time']) / 
+                      fixed['waiting_time'] * 100).rolling(window).mean()
+        ax.plot(improvement, 
+               color=colors[model],
+               linestyle=line_styles[model],
+               label=f'{model.upper()} Improvement')
+    ax.set_title('Waiting Time Improvement vs Fixed Timing', fontsize=12)
+    ax.set_ylabel('Improvement (%)', fontsize=10)
+    ax.axhline(0, color='black', linestyle='--', alpha=0.5)
     
-    plt.tight_layout()
-    plt.savefig(output_filename, dpi=300, bbox_inches='tight')
+    # Prediction accuracy
+    ax = axs[2,0]
+    models_to_plot = ['lstm', 'bilstm', 'gru', 'bigru']
+    for model in models_to_plot:
+        ax.plot(models[model]['predictions'], 
+               color=colors[model],
+               linestyle=line_styles[model],
+               label=f'{model.upper()} Predictions')
+    ax.plot(fixed['actual_flows'], 'k--', label='Actual Traffic', alpha=0.7)
+    ax.set_title('Traffic Flow Predictions vs Actual', fontsize=12)
+    ax.set_ylabel('Vehicle Count', fontsize=10)
+    
+    # Create unified legend
+    legend_elements = [Line2D([0], [0], color=colors[m], linestyle=line_styles[m],
+                      lw=2, label=m.upper()) for m in colors]
+    fig.legend(handles=legend_elements, loc='lower center', ncol=6, fontsize=10)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig('Generated Visualizations/full_comparison.png', dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f'Prediction accuracy plot saved as {output_filename}')
+    # Individual prediction plots
+    for model in models_to_plot:
+        plt.figure(figsize=(12, 6))
+        plt.plot(models[model]['predictions'], label='Predictions', color=colors[model])
+        plt.plot(models[model]['actual_flows'], label='Actual', color='black', alpha=0.7)
+        plt.title(f'{model.upper()} Prediction Accuracy', fontsize=14)
+        plt.ylabel('Vehicle Count')
+        plt.legend()
+        plt.savefig(f'Generated Visualizations/{model}_predictions.png', dpi=150)
+        plt.close()
 
-if __name__ == '__main__':
-    print("This is a visualization module for traffic simulation data.")
-    print("Import and use the functions from another script.")
+def create_prediction_accuracy_plot(predictions, actuals, filename):
+    plt.figure(figsize=(10, 6))
+    plt.plot(predictions, label='Predictions', alpha=0.8)
+    plt.plot(actuals, label='Actual', alpha=0.6)
+    plt.title('Prediction Accuracy')
+    plt.legend()
+    plt.savefig(filename)
+    plt.close()

@@ -9,10 +9,17 @@ from statsmodels.tsa.arima.model import ARIMA
 from sumolib.net import Phase
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM, Input, Bidirectional  # NEW
+from tensorflow.keras.layers import Dense, LSTM, GRU, Bidirectional, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
-from visualization import generate_visualizations, create_prediction_accuracy_plot
+import matplotlib.pyplot as plt
+import warnings
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
+
+# Suppress warnings
+warnings.simplefilter('ignore', ConvergenceWarning)
+warnings.filterwarnings("ignore", message="Non-invertible starting MA parameters found.")
+warnings.simplefilter('ignore', ConvergenceWarning)
 
 # Configure GPU memory growth
 try:
@@ -35,24 +42,21 @@ def getdatetime():
     currentDT = pytz.utc.localize(utc_now.replace(tzinfo=None)).astimezone(pytz.timezone('Asia/Singapore'))
     return currentDT.strftime('%Y-%m-%d %H:%M:%S')
 
-def create_lstm_model(seq_length):
-    model = Sequential([
-        Input(shape=(seq_length, 1)),
-        LSTM(32, activation='relu'),
-        Dense(8, activation='relu'),
-        Dense(1)
-    ])
-    model.compile(optimizer='adam', loss='mse')
-    return model
-
-# NEW Bi-LSTM model creation
-def create_bilstm_model(seq_length):
-    model = Sequential([
-        Input(shape=(seq_length, 1)),
-        Bidirectional(LSTM(32, activation='relu')),  # Modified line
-        Dense(8, activation='relu'),
-        Dense(1)
-    ])
+def create_model(seq_length, model_type):
+    model = Sequential()
+    model.add(Input(shape=(seq_length, 1)))
+    
+    if model_type == 'lstm':
+        model.add(LSTM(32, activation='relu'))
+    elif model_type == 'bilstm':
+        model.add(Bidirectional(LSTM(32, activation='relu')))
+    elif model_type == 'gru':
+        model.add(GRU(32, activation='relu'))
+    elif model_type == 'bigru':
+        model.add(Bidirectional(GRU(32, activation='relu')))
+    
+    model.add(Dense(8, activation='relu'))
+    model.add(Dense(1))
     model.compile(optimizer='adam', loss='mse')
     return model
 
@@ -86,7 +90,7 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
     current_logic = programs[0]
     phases = current_logic.phases
     
-    # Initialize all data lists with consistent starting point
+    # Initialize all data lists
     time_series_data = []
     time_stamps = []
     waiting_times = []
@@ -96,21 +100,14 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
     actual_flows = []
     lane_densities = {}
     
-    # Initialize prediction tracking
-    current_prediction = 0
-    last_actual_flow = 0
-    
-    # Vehicle tracking
-    completed_vehicles = set()
-    vehicle_start_times = {}
-    incoming_lanes = []
-    completed_travel_times = []
-    
     # Model setup
-    model = None  # Changed to generic model variable
+    model = None
     scaler = MinMaxScaler(feature_range=(0, 1))
     seq_length = 10
     last_training_time = 0
+    vehicle_start_times = {}
+    completed_vehicles = set()
+    incoming_lanes = []
     
     # Get incoming lanes
     for link_index in range(traci.trafficlight.getRedYellowGreenState(target_tl).count('G')):
@@ -131,196 +128,194 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
         step += 1
         current_time = getdatetime()
         
-        # Get current vehicle data
+        # Collect metrics
         vehicle_ids = traci.vehicle.getIDList()
         vehicle_count = len(vehicle_ids)
         
-        # Record core metrics every step
+        # Store the actual flow value immediately
+        current_flow = vehicle_count if vehicle_count > 0 else 0.001
+        actual_flows.append(current_flow)
+        
+        # Core metrics collection
         time_series_data.append(vehicle_count)
         time_stamps.append(current_time)
         
-        # Track vehicle start times
-        for veh_id in vehicle_ids:
-            if veh_id not in vehicle_start_times:
-                vehicle_start_times[veh_id] = step
+        # Waiting time calculation
+        total_waiting = sum(traci.vehicle.getWaitingTime(v) for v in vehicle_ids) if vehicle_ids else 0
+        avg_waiting = total_waiting / vehicle_count if vehicle_count > 0 else 0
+        waiting_times.append(avg_waiting)
         
-        # Calculate waiting time
-        total_waiting_time = sum(traci.vehicle.getWaitingTime(veh_id) for veh_id in vehicle_ids) if vehicle_ids else 0
-        avg_waiting_time = total_waiting_time / vehicle_count if vehicle_count > 0 else 0
-        waiting_times.append(avg_waiting_time)
-        
-        # Calculate queue length
-        queue = sum(1 for veh_id in vehicle_ids if traci.vehicle.getSpeed(veh_id) < 0.1)
+        # Queue length calculation
+        queue = sum(1 for v in vehicle_ids if traci.vehicle.getSpeed(v) < 0.1)
         queue_lengths.append(queue)
         
-        # Calculate travel times
-        current_completed_times = []
-        for veh_id in list(vehicle_start_times.keys()):
-            if veh_id not in vehicle_ids and veh_id not in completed_vehicles:
-                completed_vehicles.add(veh_id)
-                trip_time = step - vehicle_start_times[veh_id]
-                current_completed_times.append(trip_time)
-                completed_travel_times.append(trip_time)
+        # Travel time calculation
+        current_travel_times = []
+        for v in list(vehicle_start_times.keys()):
+            if v not in vehicle_ids and v not in completed_vehicles:
+                trip_time = step - vehicle_start_times[v]
+                current_travel_times.append(trip_time)
+                completed_vehicles.add(v)
+        travel_times.append(np.mean(current_travel_times) if current_travel_times else 0)
         
-        avg_travel_time = np.mean(completed_travel_times) if completed_travel_times else 0
-        travel_times.append(avg_travel_time)
-        
-        # Calculate lane densities
+        # Lane densities
         current_lane_densities = {}
         for lane in incoming_lanes:
             try:
-                vehicles_on_lane = traci.lane.getLastStepVehicleNumber(lane)
-                lane_length = traci.lane.getLength(lane)
-                density = vehicles_on_lane / lane_length if lane_length > 0 else 0
-                current_lane_densities[lane] = density
+                count = traci.lane.getLastStepVehicleNumber(lane)
+                length = traci.lane.getLength(lane)
+                current_lane_densities[lane] = count / length if length > 0 else 0
             except:
                 current_lane_densities[lane] = 0
         lane_densities[step] = current_lane_densities
         
-        # Initialize prediction values for this step
-        step_prediction = current_prediction
-        step_actual_flow = last_actual_flow
+        # Initialize prediction with 0 - we'll update it if a prediction is made
+        current_prediction = 0
         
-        # Adaptive timing logic
-        if use_adaptive_timing and len(time_series_data) > 30 and step % 5 == 0:
-            step_actual_flow = vehicle_count if vehicle_count > 0 else 0.001
-            
-            if model_type == 'arima':
-                try:
-                    window_size = 60
-                    transformed_data = np.log1p(time_series_data[-window_size:])
-                    model = ARIMA(transformed_data, order=(1, 1, 1), 
-                                enforce_stationarity=False, enforce_invertibility=False)
-                    model_fit = model.fit()
-                    prediction = np.expm1(model_fit.forecast(steps=1))
-                    step_prediction = max(prediction[0], 0)
-                    
-                    # Traffic light adjustment
-                    congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
-                    new_phases = []
-                    
-                    for i, phase in enumerate(phases):
-                        if 'G' in phase.state:
-                            green_lanes = []
-                            for j, state in enumerate(phase.state):
-                                if state == 'G' and j < len(traci.trafficlight.getControlledLinks(target_tl)):
-                                    links = traci.trafficlight.getControlledLinks(target_tl)[j]
-                                    if links:
-                                        green_lanes.append(links[0][0])
-                            
-                            phase_congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
-                            
-                            if phase_congestion > 0.1 or step_prediction > 20:
-                                new_duration = min(phase.maxDur, phase.duration + 10)
-                            else:
-                                new_duration = max(phase.minDur, phase.duration - 5)
-                            
-                            new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
-                        else:
-                            new_duration = min(phase.duration, 5) if 'y' in phase.state else phase.duration
-                            new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
-                    
+        # Adaptive control logic
+        if use_adaptive_timing and len(time_series_data) > 36 and step % 5 == 0:
+            try:
+                if model_type == 'arima':
+                    # Get current program details first
                     current_program = traci.trafficlight.getAllProgramLogics(target_tl)[0]
-                    updated_program = traci.trafficlight.Logic(
-                        programID=current_program.programID,
-                        type=current_program.type,
-                        currentPhaseIndex=current_program.currentPhaseIndex,
-                        phases=new_phases,
-                        subParameter=current_program.subParameter
-                    )
-                    traci.trafficlight.setProgramLogic(target_tl, updated_program)
+                    program_type = current_program.type
                     
-                except Exception as e:
-                    print(f'ARIMA Error: {e}')
-                    step_prediction = current_prediction
-            
-            # NEW: Added Bi-LSTM model handling
-            elif model_type in ['lstm', 'bilstm']:
-                try:
-                    if len(time_series_data) >= max(30, seq_length + 5):
-                        if (step % 100 == 0 or model is None) and len(time_series_data) >= seq_length + 5:
-                            tf.keras.backend.clear_session()
-                            new_data = np.array(time_series_data).reshape(-1, 1)
-                            scaler.fit(new_data)
-                            normalized_data = scaler.transform(new_data)
-                            
-                            X, y = create_sequences(normalized_data, seq_length)
-                            
-                            if len(X) > 0 and len(y) > 0:
-                                early_stopping = EarlyStopping(monitor='loss', patience=3)
-                                # Choose model based on type
-                                if model_type == 'lstm':
-                                    model = create_lstm_model(seq_length)
-                                else:
-                                    model = create_bilstm_model(seq_length)
-                                model.fit(X, y, epochs=5, batch_size=16, 
-                                         verbose=0, callbacks=[early_stopping])
-                                last_training_time = step
+                    try:
+                        # ARIMA Prediction Logic
+                        window_size = min(60, len(time_series_data))  # Ensure we don't ask for more data than available
+                        transformed_data = np.log1p(time_series_data[-window_size:])
+                        model = ARIMA(transformed_data, order=(1, 1, 1))
+                        model_fit = model.fit(method_kwargs={"maxiter": 1000})
+                        prediction_result = np.expm1(model_fit.forecast(steps=1))
+                        current_prediction = max(prediction_result[0], 0)
                         
-                        if model is not None and len(time_series_data) >= seq_length:
-                            recent_data = np.array(time_series_data[-seq_length:]).reshape(-1, 1)
-                            normalized_recent = scaler.transform(recent_data)
-                            normalized_recent = normalized_recent.reshape(1, seq_length, 1)
-                            
-                            normalized_prediction = model.predict(normalized_recent, verbose=0)
-                            step_prediction = scaler.inverse_transform(normalized_prediction)[0][0]
-                            step_prediction = max(step_prediction, 0)
-                        else:
-                            step_prediction = current_prediction
-                    else:
-                        step_prediction = current_prediction
+                        # Print debug info occasionally
+                        if step % 50 == 0:
+                            print(f"Step {step}, Actual: {current_flow}, Prediction: {current_prediction}")
+                        
+                        # Initialize new_phases with current phases first
+                        new_phases = [Phase(p.duration, p.state, p.minDur, p.maxDur) for p in phases]
+                        
+                        # Traffic light adjustment
+                        congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
+                        
+                        # Modify phases based on prediction
+                        for i, phase in enumerate(phases):
+                            if 'G' in phase.state:
+                                green_lanes = []
+                                for j, state in enumerate(phase.state):
+                                    if state == 'G' and j < len(traci.trafficlight.getControlledLinks(target_tl)):
+                                        links = traci.trafficlight.getControlledLinks(target_tl)[j]
+                                        if links:
+                                            green_lanes.append(links[0][0])
+                                
+                                phase_congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
+                                
+                                if phase_congestion > 0.1 or current_prediction > 20:
+                                    new_phases[i] = Phase(
+                                        min(phase.maxDur, phase.duration + 10),
+                                        phase.state,
+                                        phase.minDur,
+                                        phase.maxDur
+                                    )
+                                else:
+                                    new_phases[i] = Phase(
+                                        max(phase.minDur, phase.duration - 5),
+                                        phase.state,
+                                        phase.minDur,
+                                        phase.maxDur
+                                    )
+                            else:
+                                new_duration = min(phase.duration, 5) if 'y' in phase.state else phase.duration
+                                new_phases[i] = Phase(
+                                    new_duration,
+                                    phase.state,
+                                    phase.minDur,
+                                    phase.maxDur
+                                )
+
+                        updated_program = traci.trafficlight.Logic(
+                            programID=current_program.programID,
+                            type=program_type,
+                            currentPhaseIndex=current_program.currentPhaseIndex,
+                            phases=new_phases,
+                            subParameter=current_program.subParameter
+                        )
+                        traci.trafficlight.setProgramLogic(target_tl, updated_program)
+
+                    except Exception as e:
+                        print(f'ARIMA Error: {str(e)}')
+                        current_prediction = actual_flows[-2] if len(actual_flows) > 1 else current_flow
+                        # Fallback to original phases if new_phases failed
+                        updated_program = traci.trafficlight.Logic(
+                            programID="fallback",
+                            type=program_type,
+                            currentPhaseIndex=0,
+                            phases=phases,
+                            subParameter=current_program.subParameter
+                        )
+                        traci.trafficlight.setProgramLogic(target_tl, updated_program)
+                
+                elif model_type in ['lstm', 'bilstm', 'gru', 'bigru']:
+                    # RNN model logic
+                    current_program = traci.trafficlight.getAllProgramLogics(target_tl)[0]
+                    program_type = current_program.type
                     
-                    # Traffic light adjustment
+                    if step % 100 == 0 or model is None:
+                        scaled_data = scaler.fit_transform(np.array(time_series_data).reshape(-1, 1))
+                        X, y = create_sequences(scaled_data, seq_length)
+                        if len(X) > 0:
+                            model = create_model(seq_length, model_type)
+                            model.fit(X, y, epochs=5, batch_size=16, 
+                                    callbacks=[EarlyStopping(monitor='loss', patience=2)], verbose=0)
+                    
+                    if model:
+                        recent = scaler.transform(np.array(time_series_data[-seq_length:]).reshape(-1, 1))
+                        prediction_result = model.predict(recent.reshape(1, seq_length, 1), verbose=0)[0][0]
+                        current_prediction = float(scaler.inverse_transform([[prediction_result]])[0][0])
+                        
+                        # Print debug info occasionally
+                        if step % 50 == 0:
+                            print(f"Step {step}, Actual: {current_flow}, Prediction: {current_prediction}")
+                    
+                    # Phase adjustment
                     congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
                     new_phases = []
                     
-                    for i, phase in enumerate(phases):
+                    for phase in phases:
                         if 'G' in phase.state:
-                            green_lanes = []
-                            for j, state in enumerate(phase.state):
-                                if state == 'G' and j < len(traci.trafficlight.getControlledLinks(target_tl)):
-                                    links = traci.trafficlight.getControlledLinks(target_tl)[j]
-                                    if links:
-                                        green_lanes.append(links[0][0])
+                            green_lanes = [
+                                link[0][0] for link in traci.trafficlight.getControlledLinks(target_tl)
+                                if link and len(link) > 0 and link[0]
+                            ]
+                            congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
                             
-                            phase_congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
-                            
-                            if phase_congestion > 0.1 or step_prediction > 20:
+                            if congestion > 0.1 or current_prediction > 20:
                                 new_duration = min(phase.maxDur, phase.duration + 10)
                             else:
                                 new_duration = max(phase.minDur, phase.duration - 5)
-                            
+                                
                             new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
                         else:
-                            new_duration = min(phase.duration, 5) if 'y' in phase.state else phase.duration
-                            new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
+                            new_phases.append(phase)
                     
-                    current_program = traci.trafficlight.getAllProgramLogics(target_tl)[0]
-                    updated_program = traci.trafficlight.Logic(
-                        programID=current_program.programID,
-                        type=current_program.type,
-                        currentPhaseIndex=current_program.currentPhaseIndex,
+                    traci.trafficlight.setProgramLogic(target_tl, traci.trafficlight.Logic(
+                        programID="adaptive",
+                        type=program_type,
                         phases=new_phases,
-                        subParameter=current_program.subParameter
-                    )
-                    traci.trafficlight.setProgramLogic(target_tl, updated_program)
-                    
-                except Exception as e:
-                    print(f'{model_type.upper()} Error: {e}')
-                    step_prediction = current_prediction
-            
-            # Update tracking variables
-            current_prediction = step_prediction
-            last_actual_flow = step_actual_flow
+                        currentPhaseIndex=traci.trafficlight.getPhase(target_tl)
+                    ))
+            except Exception as e:
+                print(f"{model_type.upper()} Error: {str(e)}")
+                current_prediction = actual_flows[-2] if len(actual_flows) > 1 else current_flow
         
-        # Append values for this step
+        # Always append the prediction (either 0 or an actual prediction)
         predictions.append(current_prediction)
-        actual_flows.append(last_actual_flow)
     
     traci.close()
     
-    # Ensure equal array lengths
-    min_length = min(
+    # Find the shortest length among all the data arrays
+    min_len = min(
         len(time_stamps),
         len(waiting_times),
         len(queue_lengths),
@@ -329,297 +324,198 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
         len(actual_flows)
     )
     
-    results = {
-        'timestamp': time_stamps[:min_length],
-        'waiting_time': waiting_times[:min_length],
-        'queue_length': queue_lengths[:min_length],
-        'travel_time': travel_times[:min_length],
-        'predictions': predictions[:min_length],
-        'actual_flows': actual_flows[:min_length],
-        'lane_densities': lane_densities,
-        'model_type': model_type
+    # Create results dataframe, ensuring all arrays are the same length
+    return pd.DataFrame({
+        'timestamp': time_stamps[:min_len],
+        'waiting_time': waiting_times[:min_len],
+        'queue_length': queue_lengths[:min_len],
+        'travel_time': travel_times[:min_len],
+        'predictions': predictions[:min_len],
+        'actual_flows': actual_flows[:min_len],
+        'model_type': [model_type] * min_len  # Create a list of the same length
+    })
+
+# ... [Keep all previous imports and GPU configuration] ...
+
+def create_prediction_accuracy_plot(predictions, actuals, filename):
+    plt.figure(figsize=(12, 6))
+    plt.plot(predictions, label='Predictions', alpha=0.7)
+    plt.plot(actuals, label='Actual Traffic', alpha=0.5)
+    plt.title('Traffic Flow Prediction Accuracy')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Vehicle Count')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(filename)
+    plt.close()
+
+def generate_visualizations(arima_df, lstm_df, bilstm_df, gru_df, bigru_df, fixed_df):
+    plt.style.use('ggplot')
+    fig, axs = plt.subplots(3, 1, figsize=(16, 18))
+    
+    # Common styling
+    colors = {
+        'arima': '#1f77b4',
+        'lstm': '#ff7f0e',
+        'bilstm': '#2ca02c',
+        'gru': '#d62728',
+        'bigru': '#9467bd',
+        'fixed': '#7f7f7f'
     }
     
-    return results
+    # Waiting Time Comparison
+    axs[0].plot(arima_df['waiting_time'].rolling(30).mean(), color=colors['arima'], label='ARIMA')
+    axs[0].plot(lstm_df['waiting_time'].rolling(30).mean(), color=colors['lstm'], label='LSTM')
+    axs[0].plot(bilstm_df['waiting_time'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM')
+    axs[0].plot(gru_df['waiting_time'].rolling(30).mean(), color=colors['gru'], label='GRU')
+    axs[0].plot(bigru_df['waiting_time'].rolling(30).mean(), color=colors['bigru'], label='BiGRU')
+    axs[0].plot(fixed_df['waiting_time'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--')
+    axs[0].set_title('Average Waiting Time Comparison (30-step Moving Average)')
+    axs[0].set_ylabel('Seconds')
+    axs[0].legend()
 
-def calculate_and_print_metrics(adaptive_df, fixed_df, model_type='ARIMA'):
-    window = 30
-    adaptive_wait_smooth = adaptive_df['waiting_time'].rolling(window=window).mean().fillna(adaptive_df['waiting_time'])
-    fixed_wait_smooth = fixed_df['waiting_time'].rolling(window=window).mean().fillna(fixed_df['waiting_time'])
-    
-    adaptive_queue_smooth = adaptive_df['queue_length'].rolling(window=window).mean().fillna(adaptive_df['queue_length'])
-    fixed_queue_smooth = fixed_df['queue_length'].rolling(window=window).mean().fillna(fixed_df['queue_length'])
-    
-    adaptive_travel_smooth = adaptive_df['travel_time'].rolling(window=window).mean().fillna(adaptive_df['travel_time'])
-    fixed_travel_smooth = fixed_df['travel_time'].rolling(window=window).mean().fillna(fixed_df['travel_time'])
-    
-    # Calculate averages based on smoothed data as in the first code
-    adaptive_wait = np.mean(adaptive_wait_smooth)
-    fixed_wait = np.mean(fixed_wait_smooth)
-    wait_improvement = ((fixed_wait - adaptive_wait) / fixed_wait) * 100 if fixed_wait > 0 else 0
-    
-    adaptive_queue = np.mean(adaptive_queue_smooth)
-    fixed_queue = np.mean(fixed_queue_smooth)
-    queue_improvement = ((fixed_queue - adaptive_queue) / fixed_queue) * 100 if fixed_queue > 0 else 0
-    
-    adaptive_travel = np.mean(adaptive_travel_smooth)
-    fixed_travel = np.mean(fixed_travel_smooth)
-    travel_improvement = ((fixed_travel - adaptive_travel) / fixed_travel) * 100 if fixed_travel > 0 else 0
-    
-    # Print metrics similar to first code
-    print(f'\nAverage Waiting Time ({model_type}):')
-    print(f'Adaptive = {adaptive_wait:.2f}s')
-    print(f'Fixed = {fixed_wait:.2f}s')
-    print(f'Improvement = {wait_improvement:.2f}%')
-    
-    print(f'\nAverage Queue Length ({model_type}):')
-    print(f'Adaptive = {adaptive_queue:.2f} vehicles')
-    print(f'Fixed = {fixed_queue:.2f} vehicles')
-    print(f'Improvement = {queue_improvement:.2f}%')
-    
-    print(f'\nAverage Travel Time ({model_type}):')
-    print(f'Adaptive = {adaptive_travel:.2f}s')
-    print(f'Fixed = {fixed_travel:.2f}s')
-    print(f'Improvement = {travel_improvement:.2f}%')
-    
-    if 'predictions' in adaptive_df.columns and 'actual_flows' in adaptive_df.columns and len(adaptive_df['predictions']) > 0:
-        predictions = np.array(adaptive_df['predictions'])
-        actuals = np.array(adaptive_df['actual_flows'])
-        
-        if len(predictions) == len(actuals) and len(predictions) > 0:
-            mse = np.mean((predictions - actuals) ** 2)
-            mae = np.mean(np.abs(predictions - actuals))
-            valid_indices = actuals != 0
-            mape = np.mean(np.abs((actuals[valid_indices] - predictions[valid_indices]) / actuals[valid_indices])) * 100 if np.any(valid_indices) else float('inf')
-            
-            print(f'\nPrediction Metrics ({model_type}):')
-            print(f'Mean Squared Error (MSE) = {mse:.2f}')
-            print(f'Mean Absolute Error (MAE) = {mae:.2f}')
-            print(f'Mean Absolute Percentage Error (MAPE) = {mape:.2f}%')
+    # Queue Length Comparison
+    axs[1].plot(arima_df['queue_length'].rolling(30).mean(), color=colors['arima'], label='ARIMA')
+    axs[1].plot(lstm_df['queue_length'].rolling(30).mean(), color=colors['lstm'], label='LSTM')
+    axs[1].plot(bilstm_df['queue_length'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM')
+    axs[1].plot(gru_df['queue_length'].rolling(30).mean(), color=colors['gru'], label='GRU')
+    axs[1].plot(bigru_df['queue_length'].rolling(30).mean(), color=colors['bigru'], label='BiGRU')
+    axs[1].plot(fixed_df['queue_length'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--')
+    axs[1].set_title('Queue Length Comparison (30-step Moving Average)')
+    axs[1].set_ylabel('Vehicles')
+    axs[1].legend()
 
-def calculate_model_comparison(arima_df, lstm_df, bilstm_df, fixed_df):  # Modified
-    # Apply similar window smoothing
-    window = 30
-    arima_wait_smooth = arima_df['waiting_time'].rolling(window=window).mean().fillna(arima_df['waiting_time'])
-    lstm_wait_smooth = lstm_df['waiting_time'].rolling(window=window).mean().fillna(lstm_df['waiting_time'])
-    bilstm_wait_smooth = bilstm_df['waiting_time'].rolling(window=window).mean().fillna(bilstm_df['waiting_time'])  # NEW
-    fixed_wait_smooth = fixed_df['waiting_time'].rolling(window=window).mean().fillna(fixed_df['waiting_time'])
+    # Travel Time Comparison
+    axs[2].plot(arima_df['travel_time'].rolling(30).mean(), color=colors['arima'], label='ARIMA')
+    axs[2].plot(lstm_df['travel_time'].rolling(30).mean(), color=colors['lstm'], label='LSTM')
+    axs[2].plot(bilstm_df['travel_time'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM')
+    axs[2].plot(gru_df['travel_time'].rolling(30).mean(), color=colors['gru'], label='GRU')
+    axs[2].plot(bigru_df['travel_time'].rolling(30).mean(), color=colors['bigru'], label='BiGRU')
+    axs[2].plot(fixed_df['travel_time'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--')
+    axs[2].set_title('Travel Time Comparison (30-step Moving Average)')
+    axs[2].set_ylabel('Seconds')
+    axs[2].set_xlabel('Simulation Steps')
+    axs[2].legend()
+
+    plt.tight_layout()
+    plt.savefig('Generated Visualizations/performance_comparison.png')
+    plt.close()
+
+def calculate_model_comparison(*model_dfs):
+    metrics = ['waiting_time', 'queue_length', 'travel_time']
+    comparisons = []
     
-    arima_queue_smooth = arima_df['queue_length'].rolling(window=window).mean().fillna(arima_df['queue_length'])
-    lstm_queue_smooth = lstm_df['queue_length'].rolling(window=window).mean().fillna(lstm_df['queue_length'])
-    bilstm_queue_smooth = bilstm_df['queue_length'].rolling(window=window).mean().fillna(bilstm_df['queue_length'])  # NEW
-    fixed_queue_smooth = fixed_df['queue_length'].rolling(window=window).mean().fillna(fixed_df['queue_length'])
+    # Get fixed timing baseline
+    fixed_df = next(df for df in model_dfs if df['model_type'].iloc[0] == 'fixed')
+    fixed_means = {metric: fixed_df[metric].rolling(30).mean().mean() for metric in metrics}
     
-    arima_travel_smooth = arima_df['travel_time'].rolling(window=window).mean().fillna(arima_df['travel_time'])
-    lstm_travel_smooth = lstm_df['travel_time'].rolling(window=window).mean().fillna(lstm_df['travel_time'])
-    bilstm_travel_smooth = bilstm_df['travel_time'].rolling(window=window).mean().fillna(bilstm_df['travel_time'])  # NEW
-    fixed_travel_smooth = fixed_df['travel_time'].rolling(window=window).mean().fillna(fixed_df['travel_time'])
-    
-    print('\n===== PERFORMANCE COMPARISON =====')
-    
-    arima_wait = np.mean(arima_wait_smooth)
-    lstm_wait = np.mean(lstm_wait_smooth)
-    bilstm_wait = np.mean(bilstm_wait_smooth)  # NEW
-    fixed_wait = np.mean(fixed_wait_smooth)
-    
-    arima_queue = np.mean(arima_queue_smooth)
-    lstm_queue = np.mean(lstm_queue_smooth)
-    bilstm_queue = np.mean(bilstm_queue_smooth)  # NEW
-    fixed_queue = np.mean(fixed_queue_smooth)
-    
-    arima_travel = np.mean(arima_travel_smooth)
-    lstm_travel = np.mean(lstm_travel_smooth)
-    bilstm_travel = np.mean(bilstm_travel_smooth)  # NEW
-    fixed_travel = np.mean(fixed_travel_smooth)
-    
-    print('--- Calculated Averages (30-step rolling window) ---')
-    print(f'ARIMA Wait: {arima_wait:.2f}, LSTM Wait: {lstm_wait:.2f}, Bi-LSTM Wait: {bilstm_wait:.2f}, Fixed Wait: {fixed_wait:.2f}')  # Modified
-    print(f'ARIMA Queue: {arima_queue:.2f}, LSTM Queue: {lstm_queue:.2f}, Bi-LSTM Queue: {bilstm_queue:.2f}, Fixed Queue: {fixed_queue:.2f}')  # Modified
-    print(f'ARIMA Travel: {arima_travel:.2f}, LSTM Travel: {lstm_travel:.2f}, Bi-LSTM Travel: {bilstm_travel:.2f}, Fixed Travel: {fixed_travel:.2f}')  # Modified
-    print('--------------------------------------------------')
-    
-    arima_wait_improvement = ((fixed_wait - arima_wait) / fixed_wait * 100) if fixed_wait > 0 else 0
-    lstm_wait_improvement = ((fixed_wait - lstm_wait) / fixed_wait * 100) if fixed_wait > 0 else 0
-    bilstm_wait_improvement = ((fixed_wait - bilstm_wait) / fixed_wait * 100) if fixed_wait > 0 else 0  # NEW
-    
-    arima_queue_improvement = ((fixed_queue - arima_queue) / fixed_queue * 100) if fixed_queue > 0 else 0
-    lstm_queue_improvement = ((fixed_queue - lstm_queue) / fixed_queue * 100) if fixed_queue > 0 else 0
-    bilstm_queue_improvement = ((fixed_queue - bilstm_queue) / fixed_queue * 100) if fixed_queue > 0 else 0  # NEW
-    
-    arima_travel_improvement = ((fixed_travel - arima_travel) / fixed_travel * 100) if fixed_travel > 0 else 0
-    lstm_travel_improvement = ((fixed_travel - lstm_travel) / fixed_travel * 100) if fixed_travel > 0 else 0
-    bilstm_travel_improvement = ((fixed_travel - bilstm_travel) / fixed_travel * 100) if fixed_travel > 0 else 0  # NEW
-    
-    print('\nImprovement over Fixed Timing:')
-    print('--------------------------------')
-    print('Metric           | ARIMA   | LSTM    | Bi-LSTM |')  # Modified
-    print('--------------------------------')
-    print(f'Waiting Time    | {arima_wait_improvement:>6.1f}% | {lstm_wait_improvement:>6.1f}% | {bilstm_wait_improvement:>6.1f}% |')  # Modified
-    print(f'Queue Length    | {arima_queue_improvement:>6.1f}% | {lstm_queue_improvement:>6.1f}% | {bilstm_queue_improvement:>6.1f}% |')  # Modified
-    print(f'Travel Time     | {arima_travel_improvement:>6.1f}% | {lstm_travel_improvement:>6.1f}% | {bilstm_travel_improvement:>6.1f}% |')  # Modified
-    print('--------------------------------')
-    
-    # Prediction metrics comparison
-    if ('predictions' in arima_df.columns and 'actual_flows' in arima_df.columns and
-        'predictions' in lstm_df.columns and 'actual_flows' in lstm_df.columns and
-        'predictions' in bilstm_df.columns and 'actual_flows' in bilstm_df.columns):  # Modified
-        
-        arima_pred = np.array(arima_df['predictions'])
-        arima_actual = np.array(arima_df['actual_flows'])
-        lstm_pred = np.array(lstm_df['predictions'])
-        lstm_actual = np.array(lstm_df['actual_flows'])
-        bilstm_pred = np.array(bilstm_df['predictions'])  # NEW
-        bilstm_actual = np.array(bilstm_df['actual_flows'])  # NEW
-        
-        if len(arima_pred) > 0 and len(lstm_pred) > 0 and len(bilstm_pred) > 0:  # Modified
-            arima_mae = np.mean(np.abs(arima_pred - arima_actual))
-            lstm_mae = np.mean(np.abs(lstm_pred - lstm_actual))
-            bilstm_mae = np.mean(np.abs(bilstm_pred - bilstm_actual))  # NEW
+    for df in model_dfs:
+        if df['model_type'].iloc[0] == 'fixed':
+            continue
             
-            print('\nPrediction Accuracy (MAE):')
-            print('--------------------------------')
-            print(f'ARIMA:    {arima_mae:.2f} vehicles')
-            print(f'LSTM:     {lstm_mae:.2f} vehicles')
-            print(f'Bi-LSTM:  {bilstm_mae:.2f} vehicles')  # NEW
-            print('--------------------------------')
+        model_name = df['model_type'].iloc[0].upper()
+        improvements = []
+        
+        for metric in metrics:
+            model_mean = df[metric].rolling(30).mean().mean()
+            fixed_mean = fixed_means[metric]
+            improvement = ((fixed_mean - model_mean) / fixed_mean * 100) if fixed_mean != 0 else 0
+            improvements.append(improvement)
+        
+        comparisons.append({
+            'Model': model_name,
+            'Waiting Time Improvement (%)': f"{improvements[0]:.2f}%",
+            'Queue Length Improvement (%)': f"{improvements[1]:.2f}%",
+            'Travel Time Improvement (%)': f"{improvements[2]:.2f}%"
+        })
+    
+    print("\n=== Model Performance Comparison ===")
+    print("\nImprovements over Fixed Timing Control:")
+    print("(Positive values indicate better performance)")
+    print("-" * 80)
+    print(pd.DataFrame(comparisons).to_markdown(index=False, tablefmt="grid"))
+    print("-" * 80)
+    
+    # Print baseline fixed timing metrics
+    print("\nFixed Timing Baseline Metrics:")
+    print("-" * 80)
+    baseline_metrics = {
+        'Metric': ['Average Waiting Time', 'Average Queue Length', 'Average Travel Time'],
+        'Value': [f"{fixed_means['waiting_time']:.2f} seconds",
+                 f"{fixed_means['queue_length']:.2f} vehicles",
+                 f"{fixed_means['travel_time']:.2f} seconds"]
+    }
+    print(pd.DataFrame(baseline_metrics).to_markdown(index=False, tablefmt="grid"))
+    print("-" * 80)
 
 def main_menu():
+    models = ['arima', 'lstm', 'bilstm', 'gru', 'bigru', 'fixed']
+    
     while True:
-        print('\n=== Traffic Simulation Menu ===')
-        print('1. Run new simulations')
-        print('2. Generate visualizations from existing data')
-        print('3. Exit')
+        print("\n=== Traffic Simulation Control Center ===")
+        print("1. Run all simulations (ARIMA, LSTM, BiLSTM, GRU, BiGRU, Fixed)")
+        print("2. Generate visualizations from existing data")
+        print("3. Print performance metrics")
+        print("4. Exit")
         
-        choice = input('\nEnter your choice (1-3): ')
+        choice = input("Enter choice (1-4): ")
         
         if choice == '1':
-            print('\nRunning simulations with multiple models...')
+            print("\nInitializing simulations...")
+            results = {}
             
-            # Run all simulations
-            adaptive_arima_results = run_simulation(model_type='arima', seed=42)
-            adaptive_lstm_results = run_simulation(model_type='lstm', seed=42)
-            adaptive_bilstm_results = run_simulation(model_type='bilstm', seed=42)  # NEW
-            fixed_results = run_simulation(use_adaptive_timing=False, seed=42)
+            for model in models:
+                print(f"Running {model.upper()} model...")
+                results[model] = run_simulation(
+                    use_adaptive_timing=(model != 'fixed'),
+                    model_type=model,
+                    seed=42
+                )
+                results[model].to_csv(f'Model Data/{model}_results.csv', index=False)
             
-            if all([adaptive_arima_results, adaptive_lstm_results, adaptive_bilstm_results, fixed_results]):  # Modified
-                # Create DataFrames
-                adaptive_arima_df = pd.DataFrame({
-                    'timestamp': adaptive_arima_results['timestamp'],
-                    'waiting_time': adaptive_arima_results['waiting_time'],
-                    'queue_length': adaptive_arima_results['queue_length'],
-                    'travel_time': adaptive_arima_results['travel_time'],
-                    'predictions': adaptive_arima_results.get('predictions', []),
-                    'actual_flows': adaptive_arima_results.get('actual_flows', [])
-                })
-                
-                adaptive_lstm_df = pd.DataFrame({
-                    'timestamp': adaptive_lstm_results['timestamp'],
-                    'waiting_time': adaptive_lstm_results['waiting_time'],
-                    'queue_length': adaptive_lstm_results['queue_length'],
-                    'travel_time': adaptive_lstm_results['travel_time'],
-                    'predictions': adaptive_lstm_results.get('predictions', []),
-                    'actual_flows': adaptive_lstm_results.get('actual_flows', [])
-                })
-                
-                # NEW: Bi-LSTM DataFrame
-                adaptive_bilstm_df = pd.DataFrame({
-                    'timestamp': adaptive_bilstm_results['timestamp'],
-                    'waiting_time': adaptive_bilstm_results['waiting_time'],
-                    'queue_length': adaptive_bilstm_results['queue_length'],
-                    'travel_time': adaptive_bilstm_results['travel_time'],
-                    'predictions': adaptive_bilstm_results.get('predictions', []),
-                    'actual_flows': adaptive_bilstm_results.get('actual_flows', [])
-                })
-                
-                fixed_df = pd.DataFrame({
-                    'timestamp': fixed_results['timestamp'],
-                    'waiting_time': fixed_results['waiting_time'],
-                    'queue_length': fixed_results['queue_length'],
-                    'travel_time': fixed_results['travel_time']
-                })
-                
-                # Save results
-                adaptive_arima_df.to_csv('Model Data (csv)/data_arima.csv', index=False)
-                adaptive_lstm_df.to_csv('Model Data (csv)/data_lstm.csv', index=False)
-                adaptive_bilstm_df.to_csv('Model Data (csv)/data_bilstm.csv', index=False)  # NEW
-                fixed_df.to_csv('Model Data (csv)/data_fixed.csv', index=False)
-                
-                print("\nGenerating visualizations...")
-                generate_visualizations(adaptive_arima_df, adaptive_lstm_df, adaptive_bilstm_df, fixed_df)  # Modified
-                
-                # Generate prediction plots
-                if 'predictions' in adaptive_arima_df.columns:
-                    create_prediction_accuracy_plot(
-                        adaptive_arima_df['predictions'], 
-                        adaptive_arima_df['actual_flows'], 
-                        'Generated Visualizations/prediction_accuracy_arima.png'
-                    )
-                if 'predictions' in adaptive_lstm_df.columns:
-                    create_prediction_accuracy_plot(
-                        adaptive_lstm_df['predictions'], 
-                        adaptive_lstm_df['actual_flows'], 
-                        'Generated Visualizations/prediction_accuracy_lstm.png'
-                    )
-                # NEW: Bi-LSTM prediction plot
-                if 'predictions' in adaptive_bilstm_df.columns:
-                    create_prediction_accuracy_plot(
-                        adaptive_bilstm_df['predictions'], 
-                        adaptive_bilstm_df['actual_flows'], 
-                        'Generated Visualizations/prediction_accuracy_bilstm.png'
-                    )
-                
-                calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, adaptive_bilstm_df, fixed_df)  # Modified
-                
-            else:
-                print('Error: One or more simulations failed to complete.')
-                
+            print("\nAll simulations completed successfully!")
+        
         elif choice == '2':
-            print('\nLoading existing simulation data...')
+            print("\nGenerating visualizations...")
             try:
-                # Load the data
-                adaptive_arima_df = pd.read_csv('Model Data (csv)/data_arima.csv')
-                adaptive_lstm_df = pd.read_csv('Model Data (csv)/data_lstm.csv')
-                adaptive_bilstm_df = pd.read_csv('Model Data (csv)/data_bilstm.csv')  # NEW
-                fixed_df = pd.read_csv('Model Data (csv)/data_fixed.csv')
+                data = {model: pd.read_csv(f'Model Data/{model}_results.csv') for model in models}
+                generate_visualizations(
+                    data['arima'], data['lstm'], data['bilstm'],
+                    data['gru'], data['bigru'], data['fixed']
+                )
                 
-                print("\nGenerating visualizations...")
-                generate_visualizations(adaptive_arima_df, adaptive_lstm_df, adaptive_bilstm_df, fixed_df)  # Modified
-                              
-                # Generate prediction plots
-                if 'predictions' in adaptive_arima_df.columns:
-                    create_prediction_accuracy_plot(
-                        adaptive_arima_df['predictions'], 
-                        adaptive_arima_df['actual_flows'], 
-                        'Generated Visualizations/prediction_accuracy_arima.png'
-                    )
-                if 'predictions' in adaptive_lstm_df.columns:
-                    create_prediction_accuracy_plot(
-                        adaptive_lstm_df['predictions'], 
-                        adaptive_lstm_df['actual_flows'], 
-                        'Generated Visualizations/prediction_accuracy_lstm.png'
-                    )
-                # NEW: Bi-LSTM prediction plot
-                if 'predictions' in adaptive_bilstm_df.columns:
-                    create_prediction_accuracy_plot(
-                        adaptive_bilstm_df['predictions'], 
-                        adaptive_bilstm_df['actual_flows'], 
-                        'Generated Visualizations/prediction_accuracy_bilstm.png'
-                    )
+                for model in models:
+                    if model != 'fixed':
+                        create_prediction_accuracy_plot(
+                            data[model]['predictions'],
+                            data[model]['actual_flows'],
+                            f'Generated Visualizations/{model}_predictions.png'
+                        )
                 
-                calculate_model_comparison(adaptive_arima_df, adaptive_lstm_df, adaptive_bilstm_df, fixed_df)  # Modified
-                
-            except FileNotFoundError as e:
-                print(f'Error: Could not find simulation results files. Please run new simulations first.')
-                print(f'Missing file: {str(e)}')
-            except Exception as e:
-                print(f'Error generating visualizations: {str(e)}')
-                
-        elif choice == '3':
-            print('\nExiting program...')
-            break
+                print("Visualizations saved in 'Generated Visualizations' folder")
             
+            except Exception as e:
+                print(f"Visualization error: {str(e)}")
+        
+        elif choice == '3':
+            print("\nCalculating metrics...")
+            try:
+                data = [pd.read_csv(f'Model Data/{model}_results.csv') for model in models]
+                calculate_model_comparison(*data)
+            except Exception as e:
+                print(f"Metric calculation error: {str(e)}")
+        
+        elif choice == '4':
+            print("Exiting program...")
+            break
+        
         else:
-            print('\nInvalid choice. Please enter 1, 2, or 3.')
+            print("Invalid choice. Please enter 1-4.")
 
 if __name__ == '__main__':
+    # Create necessary directories
+    import os
+    os.makedirs('Model Data', exist_ok=True)
+    os.makedirs('Generated Visualizations', exist_ok=True)
+    
     main_menu()

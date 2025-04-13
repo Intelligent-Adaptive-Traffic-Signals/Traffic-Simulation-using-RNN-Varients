@@ -1,3 +1,6 @@
+import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Add this line FIRST
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import traci
 import numpy as np
 import pandas as pd
@@ -19,7 +22,6 @@ from statsmodels.tools.sm_exceptions import ConvergenceWarning
 # Suppress warnings
 warnings.simplefilter('ignore', ConvergenceWarning)
 warnings.filterwarnings("ignore", message="Non-invertible starting MA parameters found.")
-warnings.simplefilter('ignore', ConvergenceWarning)
 
 # Configure GPU memory growth
 try:
@@ -151,12 +153,51 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
         
         # Travel time calculation
         current_travel_times = []
-        for v in list(vehicle_start_times.keys()):
-            if v not in vehicle_ids and v not in completed_vehicles:
+        
+        # Track new vehicles that enter the simulation
+        for v in vehicle_ids:
+            if v not in vehicle_start_times and v not in completed_vehicles:
+                vehicle_start_times[v] = step
+        
+        # Calculate travel times for vehicles that have completed their route
+        arrived_vehicles = traci.simulation.getArrivedIDList()
+        for v in arrived_vehicles:
+            if v in vehicle_start_times:
                 trip_time = step - vehicle_start_times[v]
-                current_travel_times.append(trip_time)
-                completed_vehicles.add(v)
-        travel_times.append(np.mean(current_travel_times) if current_travel_times else 0)
+                if trip_time > 0:  # Make sure we have a valid travel time
+                    current_travel_times.append(trip_time)
+                    completed_vehicles.add(v)  # Add to completed set
+                del vehicle_start_times[v]  # Remove from tracking
+        
+        # If no vehicles completed this step but we have vehicles in the simulation,
+        # we should estimate current travel times for active vehicles
+        if not current_travel_times and vehicle_ids:
+            # Calculate time in simulation for active vehicles
+            active_travel_times = []
+            for v in vehicle_ids:
+                if v in vehicle_start_times:
+                    current_duration = step - vehicle_start_times[v]
+                    if current_duration > 0:
+                        active_travel_times.append(current_duration)
+            
+            # If we have active vehicles with travel times, use their average
+            # This gives us a running estimate even before vehicles complete
+            if active_travel_times:
+                avg_travel_time = np.mean(active_travel_times)
+            else:
+                avg_travel_time = travel_times[-1] if travel_times else 0
+        else:
+            # Use completed vehicle travel times if available
+            avg_travel_time = np.mean(current_travel_times) if current_travel_times else (travel_times[-1] if travel_times else 0)
+        
+        travel_times.append(avg_travel_time)
+        
+        # Debug output for travel times
+        if step % 100 == 0:
+            print(f"Step {step}: {len(current_travel_times)} vehicles completed trips")
+            print(f"Average travel time: {avg_travel_time:.2f} seconds")
+            print(f"Currently tracking {len(vehicle_start_times)} vehicles")
+            print(f"Total completed: {len(completed_vehicles)} vehicles")
         
         # Lane densities
         current_lane_densities = {}
@@ -278,23 +319,38 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                         if step % 50 == 0:
                             print(f"Step {step}, Actual: {current_flow}, Prediction: {current_prediction}")
                     
-                    # Phase adjustment
-                    congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
-                    new_phases = []
+                    # Proportional adjustment based on prediction
+                    prediction_factor = min(1.5, max(0.5, current_prediction / 15))  # Scale factor based on prediction
                     
+                    # Phase adjustment with model-specific weights
+                    new_phases = []
                     for phase in phases:
                         if 'G' in phase.state:
+                            # Get congestion data for this phase
                             green_lanes = [
                                 link[0][0] for link in traci.trafficlight.getControlledLinks(target_tl)
                                 if link and len(link) > 0 and link[0]
                             ]
                             congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
                             
-                            if congestion > 0.1 or current_prediction > 20:
-                                new_duration = min(phase.maxDur, phase.duration + 10)
-                            else:
-                                new_duration = max(phase.minDur, phase.duration - 5)
-                                
+                            # Calculate base duration adjustment from congestion
+                            congestion_factor = min(1.5, max(0.5, congestion * 5))
+                            
+                            # Combine factors - different models might weight these differently
+                            if model_type == 'lstm':
+                                combined_factor = prediction_factor * 0.7 + congestion_factor * 0.3
+                            elif model_type == 'bilstm':
+                                combined_factor = prediction_factor * 0.6 + congestion_factor * 0.4
+                            elif model_type == 'gru':
+                                combined_factor = prediction_factor * 0.5 + congestion_factor * 0.5
+                            elif model_type == 'bigru':
+                                combined_factor = prediction_factor * 0.4 + congestion_factor * 0.6
+                            
+                            # Apply combined factor to base duration
+                            base_duration = (phase.maxDur + phase.minDur) / 2
+                            new_duration = int(base_duration * combined_factor)
+                            new_duration = max(phase.minDur, min(phase.maxDur, new_duration))
+                            
                             new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
                         else:
                             new_phases.append(phase)

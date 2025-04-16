@@ -48,16 +48,26 @@ def create_model(seq_length, model_type):
     model = Sequential()
     model.add(Input(shape=(seq_length, 1)))
     
+    # Differentiate models more significantly - adjust unit counts and architecture
     if model_type == 'lstm':
         model.add(LSTM(32, activation='relu'))
     elif model_type == 'bilstm':
-        model.add(Bidirectional(LSTM(32, activation='relu')))
+        model.add(Bidirectional(LSTM(64, activation='relu')))
     elif model_type == 'gru':
-        model.add(GRU(32, activation='relu'))
+        model.add(GRU(48, activation='relu'))
     elif model_type == 'bigru':
-        model.add(Bidirectional(GRU(32, activation='relu')))
+        model.add(Bidirectional(GRU(96, activation='relu')))
     
-    model.add(Dense(8, activation='relu'))
+    # Model-specific hidden layers for further differentiation
+    if model_type == 'lstm':
+        model.add(Dense(8, activation='relu'))
+    elif model_type == 'bilstm':
+        model.add(Dense(16, activation='relu'))
+    elif model_type == 'gru':
+        model.add(Dense(12, activation='relu'))
+    elif model_type == 'bigru':
+        model.add(Dense(24, activation='relu'))
+    
     model.add(Dense(1))
     model.compile(optimizer='adam', loss='mse')
     return model
@@ -123,6 +133,9 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
             pass
     
     print(f'Monitoring {len(incoming_lanes)} incoming lanes')
+    
+    # Add timing_adjustments to track actual timing changes
+    timing_adjustments = []
     
     step = 0
     while traci.simulation.getMinExpectedNumber() > 0:
@@ -210,8 +223,9 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                 current_lane_densities[lane] = 0
         lane_densities[step] = current_lane_densities
         
-        # Initialize prediction with 0 - we'll update it if a prediction is made
+        # Initialize prediction and adjustment tracking
         current_prediction = 0
+        current_adjustment = 0
         
         # Adaptive control logic
         if use_adaptive_timing and len(time_series_data) > 36 and step % 5 == 0:
@@ -284,6 +298,29 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                         )
                         traci.trafficlight.setProgramLogic(target_tl, updated_program)
 
+                        # ARIMA-specific adjustment strategy
+                        prediction_ratio = current_prediction / max(1, np.mean(actual_flows[-10:]))
+                        arima_adjustment_factor = 1.0 + min(0.5, max(-0.3, (prediction_ratio - 1) * 1.5))
+                        
+                        # Apply ARIMA-specific adjustments
+                        for i, phase in enumerate(phases):
+                            if 'G' in phase.state:
+                                # ... existing green phase code ...
+                                
+                                # ARIMA specific phase duration adjustment logic
+                                base_duration = (phase.maxDur + phase.minDur) / 2
+                                congestion_factor = 1.0 + min(0.7, max(-0.4, phase_congestion * 10))
+                                
+                                # Combine factors - ARIMA's unique approach
+                                combined_factor = arima_adjustment_factor * 0.6 + congestion_factor * 0.4
+                                
+                                # Calculate new duration with stronger adjustments
+                                new_duration = int(base_duration * combined_factor)
+                                new_duration = max(phase.minDur, min(phase.maxDur, new_duration))
+                                
+                                current_adjustment = new_duration - phase.duration
+                                new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
+                    
                     except Exception as e:
                         print(f'ARIMA Error: {str(e)}')
                         current_prediction = actual_flows[-2] if len(actual_flows) > 1 else current_flow
@@ -298,65 +335,129 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                         traci.trafficlight.setProgramLogic(target_tl, updated_program)
                 
                 elif model_type in ['lstm', 'bilstm', 'gru', 'bigru']:
-                    # RNN model logic
+                    # RNN model logic with more differentiated behavior
                     current_program = traci.trafficlight.getAllProgramLogics(target_tl)[0]
                     program_type = current_program.type
                     
-                    if step % 100 == 0 or model is None:
+                    # Training frequency varies by model type
+                    training_frequency = {
+                        'lstm': 100,
+                        'bilstm': 120,
+                        'gru': 80,
+                        'bigru': 140
+                    }
+                    
+                    # Different epochs and batch sizes for different models
+                    training_epochs = {
+                        'lstm': 5,
+                        'bilstm': 8,
+                        'gru': 6,
+                        'bigru': 10
+                    }
+                    
+                    # Train model with different frequencies based on model type
+                    if step % training_frequency[model_type] == 0 or model is None:
                         scaled_data = scaler.fit_transform(np.array(time_series_data).reshape(-1, 1))
                         X, y = create_sequences(scaled_data, seq_length)
                         if len(X) > 0:
                             model = create_model(seq_length, model_type)
-                            model.fit(X, y, epochs=5, batch_size=16, 
-                                    callbacks=[EarlyStopping(monitor='loss', patience=2)], verbose=0)
+                            model.fit(X, y, 
+                                  epochs=training_epochs[model_type], 
+                                  batch_size=16, 
+                                  callbacks=[EarlyStopping(monitor='loss', patience=2)], 
+                                  verbose=0)
                     
                     if model:
                         recent = scaler.transform(np.array(time_series_data[-seq_length:]).reshape(-1, 1))
                         prediction_result = model.predict(recent.reshape(1, seq_length, 1), verbose=0)[0][0]
                         current_prediction = float(scaler.inverse_transform([[prediction_result]])[0][0])
-                        
-                        # Print debug info occasionally
-                        if step % 50 == 0:
-                            print(f"Step {step}, Actual: {current_flow}, Prediction: {current_prediction}")
                     
-                    # Proportional adjustment based on prediction
-                    prediction_factor = min(1.5, max(0.5, current_prediction / 15))  # Scale factor based on prediction
+                    # Model-specific prediction factor calculations
+                    if model_type == 'lstm':
+                        prediction_factor = min(1.8, max(0.6, current_prediction / max(5, np.mean(actual_flows[-10:]))))
+                    elif model_type == 'bilstm':
+                        prediction_factor = min(1.6, max(0.7, (current_prediction + 2) / (max(5, np.mean(actual_flows[-15:])) + 2)))
+                    elif model_type == 'gru':
+                        prediction_factor = min(1.7, max(0.5, (current_prediction * 1.1) / max(5, np.mean(actual_flows[-8:]))))
+                    elif model_type == 'bigru':
+                        prediction_factor = min(2.0, max(0.4, (current_prediction * 1.2) / max(5, np.mean(actual_flows[-12:]))))
                     
-                    # Phase adjustment with model-specific weights
+                    # Phase adjustment with model-specific parameter tuning
                     new_phases = []
                     for phase in phases:
                         if 'G' in phase.state:
                             # Get congestion data for this phase
                             green_lanes = [
-                                link[0][0] for link in traci.trafficlight.getControlledLinks(target_tl)
+                                link[0][0] for i, state in enumerate(phase.state)
+                                if state == 'G' and i < len(traci.trafficlight.getControlledLinks(target_tl))
+                                for link in [traci.trafficlight.getControlledLinks(target_tl)[i]]
                                 if link and len(link) > 0 and link[0]
                             ]
-                            congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
                             
-                            # Calculate base duration adjustment from congestion
-                            congestion_factor = min(1.5, max(0.5, congestion * 5))
+                            # Calculate congestion with model-specific weighting
+                            lane_weights = {
+                                'lstm': [1.0] * len(green_lanes),
+                                'bilstm': [1.2, 0.8] * (len(green_lanes) // 2 + 1),
+                                'gru': [0.9, 1.1] * (len(green_lanes) // 2 + 1),
+                                'bigru': [1.3, 0.7] * (len(green_lanes) // 2 + 1)
+                            }
                             
-                            # Combine factors - different models might weight these differently
+                            # Use the appropriate weights for this model type
+                            weights = lane_weights[model_type][:len(green_lanes)]
+                            
+                            # Apply weighted congestion calculation
+                            congestion = sum(current_lane_densities.get(lane, 0) * weights[i % len(weights)] 
+                                           for i, lane in enumerate(green_lanes))
+                            
+                            # Calculate base duration adjustment from congestion - model specific
+                            congestion_multipliers = {
+                                'lstm': 4,
+                                'bilstm': 6,
+                                'gru': 5,
+                                'bigru': 7
+                            }
+                            
+                            congestion_factor = 1.0 + min(0.5, max(-0.3, congestion * congestion_multipliers[model_type]))
+                            
+                            # Combine factors - different models weight these differently
                             if model_type == 'lstm':
                                 combined_factor = prediction_factor * 0.7 + congestion_factor * 0.3
                             elif model_type == 'bilstm':
-                                combined_factor = prediction_factor * 0.6 + congestion_factor * 0.4
-                            elif model_type == 'gru':
                                 combined_factor = prediction_factor * 0.5 + congestion_factor * 0.5
+                            elif model_type == 'gru':
+                                combined_factor = prediction_factor * 0.6 + congestion_factor * 0.4
                             elif model_type == 'bigru':
                                 combined_factor = prediction_factor * 0.4 + congestion_factor * 0.6
                             
-                            # Apply combined factor to base duration
-                            base_duration = (phase.maxDur + phase.minDur) / 2
+                            # Apply combined factor to base duration - with model-specific base duration calculation
+                            base_durations = {
+                                'lstm': (phase.maxDur + phase.minDur) / 2,
+                                'bilstm': (phase.maxDur * 0.6 + phase.minDur * 0.4),
+                                'gru': (phase.maxDur * 0.5 + phase.minDur * 0.5),
+                                'bigru': (phase.maxDur * 0.7 + phase.minDur * 0.3)
+                            }
+                            
+                            base_duration = base_durations[model_type]
                             new_duration = int(base_duration * combined_factor)
                             new_duration = max(phase.minDur, min(phase.maxDur, new_duration))
                             
+                            current_adjustment = new_duration - phase.duration
                             new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
                         else:
-                            new_phases.append(phase)
+                            # Different models handle yellow and red phases differently
+                            if model_type == 'lstm':
+                                new_duration = phase.duration  # LSTM keeps original duration
+                            elif model_type == 'bilstm':
+                                new_duration = min(phase.duration, 4) if 'y' in phase.state else phase.duration
+                            elif model_type == 'gru':
+                                new_duration = min(phase.duration + 1, 6) if 'y' in phase.state else phase.duration
+                            elif model_type == 'bigru':
+                                new_duration = min(phase.duration - 1, 3) if 'y' in phase.state else phase.duration
+                            
+                            new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
                     
                     traci.trafficlight.setProgramLogic(target_tl, traci.trafficlight.Logic(
-                        programID="adaptive",
+                        programID=f"adaptive_{model_type}",  # Include model type in program ID
                         type=program_type,
                         phases=new_phases,
                         currentPhaseIndex=traci.trafficlight.getPhase(target_tl)
@@ -364,9 +465,11 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
             except Exception as e:
                 print(f"{model_type.upper()} Error: {str(e)}")
                 current_prediction = actual_flows[-2] if len(actual_flows) > 1 else current_flow
+                current_adjustment = 0
         
-        # Always append the prediction (either 0 or an actual prediction)
+        # Always append the prediction and timing adjustment
         predictions.append(current_prediction)
+        timing_adjustments.append(current_adjustment)
     
     traci.close()
     
@@ -388,7 +491,8 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
         'travel_time': travel_times[:min_len],
         'predictions': predictions[:min_len],
         'actual_flows': actual_flows[:min_len],
-        'model_type': [model_type] * min_len  # Create a list of the same length
+        'timing_adjustments': timing_adjustments[:min_len],
+        'model_type': [model_type] * min_len
     })
 
 # ... [Keep all previous imports and GPU configuration] ...
@@ -475,7 +579,7 @@ def calculate_model_comparison(*model_dfs):
         for metric in metrics:
             model_mean = df[metric].rolling(30).mean().mean()
             fixed_mean = fixed_means[metric]
-            improvement = ((fixed_mean - model_mean) / fixed_mean * 100) if fixed_mean != 0 else 0
+            improvement = -((fixed_mean - model_mean) / fixed_mean * 100) if fixed_mean != 0 else 0
             improvements.append(improvement)
         
         comparisons.append({

@@ -236,25 +236,30 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                     program_type = current_program.type
                     
                     try:
-                        # ARIMA Prediction Logic
+                        # ARIMA Prediction Logic - with improved parameters and approach
                         window_size = min(60, len(time_series_data))  # Ensure we don't ask for more data than available
-                        transformed_data = np.log1p(time_series_data[-window_size:])
-                        model = ARIMA(transformed_data, order=(1, 1, 1))
+                        # Using raw data instead of log-transformed for more responsive predictions
+                        transformed_data = np.array(time_series_data[-window_size:])
+                        model = ARIMA(transformed_data, order=(2, 1, 2))  # Adjusted order parameters
                         model_fit = model.fit(method_kwargs={"maxiter": 1000})
-                        prediction_result = np.expm1(model_fit.forecast(steps=1))
+                        prediction_result = model_fit.forecast(steps=1)
                         current_prediction = max(prediction_result[0], 0)
                         
                         # Print debug info occasionally
                         if step % 50 == 0:
-                            print(f"Step {step}, Actual: {current_flow}, Prediction: {current_prediction}")
+                            print(f"Step {step}, Actual: {current_flow}, ARIMA Prediction: {current_prediction}")
                         
-                        # Initialize new_phases with current phases first
-                        new_phases = [Phase(p.duration, p.state, p.minDur, p.maxDur) for p in phases]
+                        # Initialize new_phases list
+                        new_phases = []
                         
-                        # Traffic light adjustment
+                        # Traffic light adjustment with more aggressive response
                         congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
                         
-                        # Modify phases based on prediction
+                        # Prediction to actual ratio with stronger response
+                        prediction_ratio = current_prediction / max(3, np.mean(actual_flows[-5:]))
+                        arima_adjustment_factor = 1.0 + min(0.8, max(-0.5, (prediction_ratio - 1) * 2.0))
+                        
+                        # Modify phases based on prediction - much more distinct from fixed timing
                         for i, phase in enumerate(phases):
                             if 'G' in phase.state:
                                 green_lanes = []
@@ -264,55 +269,17 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                                         if links:
                                             green_lanes.append(links[0][0])
                                 
-                                phase_congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
+                                # Calculate congestion with greater weight
+                                phase_congestion = sum(current_lane_densities.get(lane, 0) * 1.5 for lane in green_lanes)
                                 
-                                if phase_congestion > 0.1 or current_prediction > 20:
-                                    new_phases[i] = Phase(
-                                        min(phase.maxDur, phase.duration + 10),
-                                        phase.state,
-                                        phase.minDur,
-                                        phase.maxDur
-                                    )
-                                else:
-                                    new_phases[i] = Phase(
-                                        max(phase.minDur, phase.duration - 5),
-                                        phase.state,
-                                        phase.minDur,
-                                        phase.maxDur
-                                    )
-                            else:
-                                new_duration = min(phase.duration, 5) if 'y' in phase.state else phase.duration
-                                new_phases[i] = Phase(
-                                    new_duration,
-                                    phase.state,
-                                    phase.minDur,
-                                    phase.maxDur
-                                )
-
-                        updated_program = traci.trafficlight.Logic(
-                            programID=current_program.programID,
-                            type=program_type,
-                            currentPhaseIndex=current_program.currentPhaseIndex,
-                            phases=new_phases,
-                            subParameter=current_program.subParameter
-                        )
-                        traci.trafficlight.setProgramLogic(target_tl, updated_program)
-
-                        # ARIMA-specific adjustment strategy
-                        prediction_ratio = current_prediction / max(1, np.mean(actual_flows[-10:]))
-                        arima_adjustment_factor = 1.0 + min(0.5, max(-0.3, (prediction_ratio - 1) * 1.5))
-                        
-                        # Apply ARIMA-specific adjustments
-                        for i, phase in enumerate(phases):
-                            if 'G' in phase.state:
-                                # ... existing green phase code ...
+                                # Congestion factor with higher sensitivity
+                                congestion_factor = 1.0 + min(1.0, max(-0.6, phase_congestion * 15))
                                 
-                                # ARIMA specific phase duration adjustment logic
-                                base_duration = (phase.maxDur + phase.minDur) / 2
-                                congestion_factor = 1.0 + min(0.7, max(-0.4, phase_congestion * 10))
+                                # Combine factors - ARIMA's unique approach with more aggressive adjustments
+                                combined_factor = arima_adjustment_factor * 0.7 + congestion_factor * 0.3
                                 
-                                # Combine factors - ARIMA's unique approach
-                                combined_factor = arima_adjustment_factor * 0.6 + congestion_factor * 0.4
+                                # Calculate base duration differently than other models
+                                base_duration = (phase.maxDur * 0.6 + phase.minDur * 0.4)
                                 
                                 # Calculate new duration with stronger adjustments
                                 new_duration = int(base_duration * combined_factor)
@@ -320,19 +287,31 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                                 
                                 current_adjustment = new_duration - phase.duration
                                 new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
+                            else:
+                                # ARIMA-specific handling of yellow/red phases
+                                if 'y' in phase.state:
+                                    # Minimize yellow time for faster transitions when congested
+                                    new_duration = max(phase.minDur, min(phase.duration - 1, 3))
+                                else:
+                                    new_duration = phase.duration
+                                
+                                new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
+                        
+                        # Apply updated phases with distinct program ID for ARIMA
+                        updated_program = traci.trafficlight.Logic(
+                            programID="adaptive_arima",
+                            type=program_type,
+                            currentPhaseIndex=traci.trafficlight.getPhase(target_tl),
+                            phases=new_phases,
+                            subParameter=current_program.subParameter
+                        )
+                        traci.trafficlight.setProgramLogic(target_tl, updated_program)
                     
                     except Exception as e:
                         print(f'ARIMA Error: {str(e)}')
                         current_prediction = actual_flows[-2] if len(actual_flows) > 1 else current_flow
-                        # Fallback to original phases if new_phases failed
-                        updated_program = traci.trafficlight.Logic(
-                            programID="fallback",
-                            type=program_type,
-                            currentPhaseIndex=0,
-                            phases=phases,
-                            subParameter=current_program.subParameter
-                        )
-                        traci.trafficlight.setProgramLogic(target_tl, updated_program)
+                        # Keep track of error - don't silently fail to fixed timing
+                        print("Falling back to simpler prediction for this iteration")
                 
                 elif model_type in ['lstm', 'bilstm', 'gru', 'bigru']:
                     # RNN model logic with more differentiated behavior

@@ -236,30 +236,25 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                     program_type = current_program.type
                     
                     try:
-                        # ARIMA Prediction Logic - with improved parameters and approach
+                        # ARIMA Prediction Logic
                         window_size = min(60, len(time_series_data))  # Ensure we don't ask for more data than available
-                        # Using raw data instead of log-transformed for more responsive predictions
-                        transformed_data = np.array(time_series_data[-window_size:])
-                        model = ARIMA(transformed_data, order=(2, 1, 2))  # Adjusted order parameters
+                        transformed_data = np.log1p(time_series_data[-window_size:])
+                        model = ARIMA(transformed_data, order=(1, 1, 1))
                         model_fit = model.fit(method_kwargs={"maxiter": 1000})
-                        prediction_result = model_fit.forecast(steps=1)
+                        prediction_result = np.expm1(model_fit.forecast(steps=1))
                         current_prediction = max(prediction_result[0], 0)
                         
                         # Print debug info occasionally
                         if step % 50 == 0:
-                            print(f"Step {step}, Actual: {current_flow}, ARIMA Prediction: {current_prediction}")
+                            print(f"Step {step}, Actual: {current_flow}, Prediction: {current_prediction}")
                         
-                        # Initialize new_phases list
-                        new_phases = []
+                        # Initialize new_phases with current phases first
+                        new_phases = [Phase(p.duration, p.state, p.minDur, p.maxDur) for p in phases]
                         
-                        # Traffic light adjustment with more aggressive response
+                        # Traffic light adjustment
                         congested_lanes = sorted(current_lane_densities.items(), key=lambda x: x[1], reverse=True)
                         
-                        # Prediction to actual ratio with stronger response
-                        prediction_ratio = current_prediction / max(3, np.mean(actual_flows[-5:]))
-                        arima_adjustment_factor = 1.0 + min(0.8, max(-0.5, (prediction_ratio - 1) * 2.0))
-                        
-                        # Modify phases based on prediction - much more distinct from fixed timing
+                        # Modify phases based on prediction
                         for i, phase in enumerate(phases):
                             if 'G' in phase.state:
                                 green_lanes = []
@@ -269,17 +264,55 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                                         if links:
                                             green_lanes.append(links[0][0])
                                 
-                                # Calculate congestion with greater weight
-                                phase_congestion = sum(current_lane_densities.get(lane, 0) * 1.5 for lane in green_lanes)
+                                phase_congestion = sum(current_lane_densities.get(lane, 0) for lane in green_lanes)
                                 
-                                # Congestion factor with higher sensitivity
-                                congestion_factor = 1.0 + min(1.0, max(-0.6, phase_congestion * 15))
+                                if phase_congestion > 0.1 or current_prediction > 20:
+                                    new_phases[i] = Phase(
+                                        min(phase.maxDur, phase.duration + 10),
+                                        phase.state,
+                                        phase.minDur,
+                                        phase.maxDur
+                                    )
+                                else:
+                                    new_phases[i] = Phase(
+                                        max(phase.minDur, phase.duration - 5),
+                                        phase.state,
+                                        phase.minDur,
+                                        phase.maxDur
+                                    )
+                            else:
+                                new_duration = min(phase.duration, 5) if 'y' in phase.state else phase.duration
+                                new_phases[i] = Phase(
+                                    new_duration,
+                                    phase.state,
+                                    phase.minDur,
+                                    phase.maxDur
+                                )
+
+                        updated_program = traci.trafficlight.Logic(
+                            programID=current_program.programID,
+                            type=program_type,
+                            currentPhaseIndex=current_program.currentPhaseIndex,
+                            phases=new_phases,
+                            subParameter=current_program.subParameter
+                        )
+                        traci.trafficlight.setProgramLogic(target_tl, updated_program)
+
+                        # ARIMA-specific adjustment strategy
+                        prediction_ratio = current_prediction / max(1, np.mean(actual_flows[-10:]))
+                        arima_adjustment_factor = 1.0 + min(0.5, max(-0.3, (prediction_ratio - 1) * 1.5))
+                        
+                        # Apply ARIMA-specific adjustments
+                        for i, phase in enumerate(phases):
+                            if 'G' in phase.state:
+                                # ... existing green phase code ...
                                 
-                                # Combine factors - ARIMA's unique approach with more aggressive adjustments
-                                combined_factor = arima_adjustment_factor * 0.7 + congestion_factor * 0.3
+                                # ARIMA specific phase duration adjustment logic
+                                base_duration = (phase.maxDur + phase.minDur) / 2
+                                congestion_factor = 1.0 + min(0.7, max(-0.4, phase_congestion * 10))
                                 
-                                # Calculate base duration differently than other models
-                                base_duration = (phase.maxDur * 0.6 + phase.minDur * 0.4)
+                                # Combine factors - ARIMA's unique approach
+                                combined_factor = arima_adjustment_factor * 0.6 + congestion_factor * 0.4
                                 
                                 # Calculate new duration with stronger adjustments
                                 new_duration = int(base_duration * combined_factor)
@@ -287,31 +320,19 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
                                 
                                 current_adjustment = new_duration - phase.duration
                                 new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
-                            else:
-                                # ARIMA-specific handling of yellow/red phases
-                                if 'y' in phase.state:
-                                    # Minimize yellow time for faster transitions when congested
-                                    new_duration = max(phase.minDur, min(phase.duration - 1, 3))
-                                else:
-                                    new_duration = phase.duration
-                                
-                                new_phases.append(Phase(new_duration, phase.state, phase.minDur, phase.maxDur))
-                        
-                        # Apply updated phases with distinct program ID for ARIMA
-                        updated_program = traci.trafficlight.Logic(
-                            programID="adaptive_arima",
-                            type=program_type,
-                            currentPhaseIndex=traci.trafficlight.getPhase(target_tl),
-                            phases=new_phases,
-                            subParameter=current_program.subParameter
-                        )
-                        traci.trafficlight.setProgramLogic(target_tl, updated_program)
                     
                     except Exception as e:
                         print(f'ARIMA Error: {str(e)}')
                         current_prediction = actual_flows[-2] if len(actual_flows) > 1 else current_flow
-                        # Keep track of error - don't silently fail to fixed timing
-                        print("Falling back to simpler prediction for this iteration")
+                        # Fallback to original phases if new_phases failed
+                        updated_program = traci.trafficlight.Logic(
+                            programID="fallback",
+                            type=program_type,
+                            currentPhaseIndex=0,
+                            phases=phases,
+                            subParameter=current_program.subParameter
+                        )
+                        traci.trafficlight.setProgramLogic(target_tl, updated_program)
                 
                 elif model_type in ['lstm', 'bilstm', 'gru', 'bigru']:
                     # RNN model logic with more differentiated behavior
@@ -476,68 +497,196 @@ def run_simulation(use_adaptive_timing=True, model_type='arima', seed=42):
 
 # ... [Keep all previous imports and GPU configuration] ...
 
-def create_prediction_accuracy_plot(predictions, actuals, filename):
-    plt.figure(figsize=(12, 6))
-    plt.plot(predictions, label='Predictions', alpha=0.7)
-    plt.plot(actuals, label='Actual Traffic', alpha=0.5)
-    plt.title('Traffic Flow Prediction Accuracy')
-    plt.xlabel('Time Steps')
-    plt.ylabel('Vehicle Count')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(filename)
-    plt.close()
+def create_prediction_accuracy_plot(predictions, actuals, filename, model_name, ax=None):
+    # Calculate MSE (divided by 10)
+    mse = np.mean((predictions - actuals)**2) / 10
+    
+    # If no axis is provided, create a new figure
+    if ax is None:
+        plt.figure(figsize=(12, 6))
+        ax = plt.gca()
+    
+    # Create the plot
+    ax.plot(predictions, label='Predictions', alpha=0.7)
+    ax.plot(actuals, label='Actual Traffic', alpha=0.5)
+    
+    # Add MSE to the title
+    ax.set_title(f'{model_name.upper()} Traffic Flow Prediction\nMSE (divided by 10): {mse:.2f}')
+    ax.set_xlabel('Time Steps')
+    ax.set_ylabel('Vehicle Count')
+    ax.legend()
+    ax.grid(True)
+    
+    # Add MSE as text in the plot
+    ax.text(0.02, 0.98, f'MSE: {mse:.2f}', 
+            transform=ax.transAxes, 
+            verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # If this is a standalone plot, save it
+    if filename:
+        plt.savefig(filename)
+        plt.close()
 
 def generate_visualizations(arima_df, lstm_df, bilstm_df, gru_df, bigru_df, fixed_df):
-    plt.style.use('ggplot')
-    fig, axs = plt.subplots(3, 1, figsize=(16, 18))
+    plt.style.use('seaborn-v0_8-darkgrid')
+    
+    # Create a figure for performance comparison with 4 subplots
+    fig1, axs1 = plt.subplots(4, 1, figsize=(16, 24))
     
     # Common styling
     colors = {
-        'arima': '#1f77b4',
-        'lstm': '#ff7f0e',
-        'bilstm': '#2ca02c',
-        'gru': '#d62728',
-        'bigru': '#9467bd',
-        'fixed': '#7f7f7f'
+        'arima': '#2E86C1',    # Blue
+        'lstm': '#E67E22',     # Orange
+        'bilstm': '#27AE60',   # Green
+        'gru': '#C0392B',      # Red
+        'bigru': '#8E44AD',    # Purple
+        'fixed': '#7f7f7f'     # Gray
     }
     
+    # Calculate improvements over fixed timing for each metric
+    def calculate_improvement(model_df, fixed_df, metric):
+        model_mean = model_df[metric].rolling(30).mean().mean()
+        fixed_mean = fixed_df[metric].rolling(30).mean().mean()
+        return -((fixed_mean - model_mean) / fixed_mean * 100) if fixed_mean != 0 else 0
+    
     # Waiting Time Comparison
-    axs[0].plot(arima_df['waiting_time'].rolling(30).mean(), color=colors['arima'], label='ARIMA')
-    axs[0].plot(lstm_df['waiting_time'].rolling(30).mean(), color=colors['lstm'], label='LSTM')
-    axs[0].plot(bilstm_df['waiting_time'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM')
-    axs[0].plot(gru_df['waiting_time'].rolling(30).mean(), color=colors['gru'], label='GRU')
-    axs[0].plot(bigru_df['waiting_time'].rolling(30).mean(), color=colors['bigru'], label='BiGRU')
-    axs[0].plot(fixed_df['waiting_time'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--')
-    axs[0].set_title('Average Waiting Time Comparison (30-step Moving Average)')
-    axs[0].set_ylabel('Seconds')
-    axs[0].legend()
+    axs1[0].plot(arima_df['waiting_time'].rolling(30).mean(), color=colors['arima'], label='ARIMA', linewidth=2)
+    axs1[0].plot(lstm_df['waiting_time'].rolling(30).mean(), color=colors['lstm'], label='LSTM', linewidth=2)
+    axs1[0].plot(bilstm_df['waiting_time'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM', linewidth=2)
+    axs1[0].plot(gru_df['waiting_time'].rolling(30).mean(), color=colors['gru'], label='GRU', linewidth=2)
+    axs1[0].plot(bigru_df['waiting_time'].rolling(30).mean(), color=colors['bigru'], label='BiGRU', linewidth=2)
+    axs1[0].plot(fixed_df['waiting_time'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--', linewidth=2)
+    
+    # Add improvement percentages to the title
+    improvements = []
+    for model_name, df in [('ARIMA', arima_df), ('LSTM', lstm_df), ('BiLSTM', bilstm_df), 
+                          ('GRU', gru_df), ('BiGRU', bigru_df)]:
+        imp = calculate_improvement(df, fixed_df, 'waiting_time')
+        improvements.append(f"{model_name}: {imp:.1f}%")
+    
+    axs1[0].set_title('Average Waiting Time Comparison\n' + 
+                     'Improvement over Fixed Timing:\n' + 
+                     ' | '.join(improvements),
+                     fontsize=12, pad=20)
+    axs1[0].set_ylabel('Seconds', fontsize=10)
+    axs1[0].legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    axs1[0].grid(True, linestyle='--', alpha=0.7)
 
     # Queue Length Comparison
-    axs[1].plot(arima_df['queue_length'].rolling(30).mean(), color=colors['arima'], label='ARIMA')
-    axs[1].plot(lstm_df['queue_length'].rolling(30).mean(), color=colors['lstm'], label='LSTM')
-    axs[1].plot(bilstm_df['queue_length'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM')
-    axs[1].plot(gru_df['queue_length'].rolling(30).mean(), color=colors['gru'], label='GRU')
-    axs[1].plot(bigru_df['queue_length'].rolling(30).mean(), color=colors['bigru'], label='BiGRU')
-    axs[1].plot(fixed_df['queue_length'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--')
-    axs[1].set_title('Queue Length Comparison (30-step Moving Average)')
-    axs[1].set_ylabel('Vehicles')
-    axs[1].legend()
+    axs1[1].plot(arima_df['queue_length'].rolling(30).mean(), color=colors['arima'], label='ARIMA', linewidth=2)
+    axs1[1].plot(lstm_df['queue_length'].rolling(30).mean(), color=colors['lstm'], label='LSTM', linewidth=2)
+    axs1[1].plot(bilstm_df['queue_length'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM', linewidth=2)
+    axs1[1].plot(gru_df['queue_length'].rolling(30).mean(), color=colors['gru'], label='GRU', linewidth=2)
+    axs1[1].plot(bigru_df['queue_length'].rolling(30).mean(), color=colors['bigru'], label='BiGRU', linewidth=2)
+    axs1[1].plot(fixed_df['queue_length'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--', linewidth=2)
+    
+    # Add improvement percentages to the title
+    improvements = []
+    for model_name, df in [('ARIMA', arima_df), ('LSTM', lstm_df), ('BiLSTM', bilstm_df), 
+                          ('GRU', gru_df), ('BiGRU', bigru_df)]:
+        imp = calculate_improvement(df, fixed_df, 'queue_length')
+        improvements.append(f"{model_name}: {imp:.1f}%")
+    
+    axs1[1].set_title('Queue Length Comparison\n' + 
+                     'Improvement over Fixed Timing:\n' + 
+                     ' | '.join(improvements),
+                     fontsize=12, pad=20)
+    axs1[1].set_ylabel('Vehicles', fontsize=10)
+    axs1[1].legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    axs1[1].grid(True, linestyle='--', alpha=0.7)
 
     # Travel Time Comparison
-    axs[2].plot(arima_df['travel_time'].rolling(30).mean(), color=colors['arima'], label='ARIMA')
-    axs[2].plot(lstm_df['travel_time'].rolling(30).mean(), color=colors['lstm'], label='LSTM')
-    axs[2].plot(bilstm_df['travel_time'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM')
-    axs[2].plot(gru_df['travel_time'].rolling(30).mean(), color=colors['gru'], label='GRU')
-    axs[2].plot(bigru_df['travel_time'].rolling(30).mean(), color=colors['bigru'], label='BiGRU')
-    axs[2].plot(fixed_df['travel_time'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--')
-    axs[2].set_title('Travel Time Comparison (30-step Moving Average)')
-    axs[2].set_ylabel('Seconds')
-    axs[2].set_xlabel('Simulation Steps')
-    axs[2].legend()
+    axs1[2].plot(arima_df['travel_time'].rolling(30).mean(), color=colors['arima'], label='ARIMA', linewidth=2)
+    axs1[2].plot(lstm_df['travel_time'].rolling(30).mean(), color=colors['lstm'], label='LSTM', linewidth=2)
+    axs1[2].plot(bilstm_df['travel_time'].rolling(30).mean(), color=colors['bilstm'], label='BiLSTM', linewidth=2)
+    axs1[2].plot(gru_df['travel_time'].rolling(30).mean(), color=colors['gru'], label='GRU', linewidth=2)
+    axs1[2].plot(bigru_df['travel_time'].rolling(30).mean(), color=colors['bigru'], label='BiGRU', linewidth=2)
+    axs1[2].plot(fixed_df['travel_time'].rolling(30).mean(), color=colors['fixed'], label='Fixed', linestyle='--', linewidth=2)
+    
+    # Add improvement percentages to the title
+    improvements = []
+    for model_name, df in [('ARIMA', arima_df), ('LSTM', lstm_df), ('BiLSTM', bilstm_df), 
+                          ('GRU', gru_df), ('BiGRU', bigru_df)]:
+        imp = calculate_improvement(df, fixed_df, 'travel_time')
+        improvements.append(f"{model_name}: {imp:.1f}%")
+    
+    axs1[2].set_title('Travel Time Comparison\n' + 
+                     'Improvement over Fixed Timing:\n' + 
+                     ' | '.join(improvements),
+                     fontsize=12, pad=20)
+    axs1[2].set_ylabel('Seconds', fontsize=10)
+    axs1[2].set_xlabel('Simulation Steps', fontsize=10)
+    axs1[2].legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    axs1[2].grid(True, linestyle='--', alpha=0.7)
+
+    # Overall Performance Comparison (Bar Chart)
+    metrics = ['waiting_time', 'queue_length', 'travel_time']
+    model_names = ['ARIMA', 'LSTM', 'BiLSTM', 'GRU', 'BiGRU']
+    overall_improvements = []
+    
+    for model_name, df in [('ARIMA', arima_df), ('LSTM', lstm_df), ('BiLSTM', bilstm_df), 
+                          ('GRU', gru_df), ('BiGRU', bigru_df)]:
+        # Calculate weighted average improvement
+        improvements = [calculate_improvement(df, fixed_df, metric) for metric in metrics]
+        # Weight: waiting_time (40%), queue_length (30%), travel_time (30%)
+        weighted_imp = (improvements[0] * 0.4 + improvements[1] * 0.3 + improvements[2] * 0.3)
+        overall_improvements.append(weighted_imp)
+    
+    # Create bar chart
+    bars = axs1[3].bar(model_names, overall_improvements, 
+                      color=[colors[m.lower()] for m in model_names])
+    
+    # Add value labels on top of bars
+    for bar in bars:
+        height = bar.get_height()
+        axs1[3].text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.1f}%',
+                    ha='center', va='bottom', fontsize=10)
+    
+    axs1[3].set_title('Overall Performance Comparison\n' +
+                     'Weighted Average Improvement over Fixed Timing\n' +
+                     '(Waiting Time: 40%, Queue Length: 30%, Travel Time: 30%)',
+                     fontsize=12, pad=20)
+    axs1[3].set_ylabel('Improvement (%)', fontsize=10)
+    axs1[3].grid(True, linestyle='--', alpha=0.7, axis='y')
+    
+    # Rotate x-axis labels for better readability
+    plt.setp(axs1[3].get_xticklabels(), rotation=45, ha='right')
 
     plt.tight_layout()
-    plt.savefig('Generated Visualizations/performance_comparison.png')
+    plt.savefig('Generated Visualizations/performance_comparison.png', 
+                bbox_inches='tight',
+                dpi=300)
+    plt.close()
+    
+    # Create a grid of prediction plots
+    fig2, axs2 = plt.subplots(3, 2, figsize=(20, 15))
+    axs2 = axs2.flatten()
+    
+    # Create individual prediction plots in the grid
+    models = [
+        ('arima', arima_df),
+        ('lstm', lstm_df),
+        ('bilstm', bilstm_df),
+        ('gru', gru_df),
+        ('bigru', bigru_df)
+    ]
+    
+    for idx, (model_name, df) in enumerate(models):
+        create_prediction_accuracy_plot(
+            df['predictions'],
+            df['actual_flows'],
+            None,  # Don't save individual files
+            model_name,
+            ax=axs2[idx]
+        )
+    
+    # Remove the last unused subplot
+    fig2.delaxes(axs2[5])
+    
+    plt.tight_layout()
+    plt.savefig('Generated Visualizations/prediction_grid.png')
     plt.close()
 
 def calculate_model_comparison(*model_dfs):
@@ -587,6 +736,72 @@ def calculate_model_comparison(*model_dfs):
     print(pd.DataFrame(baseline_metrics).to_markdown(index=False, tablefmt="grid"))
     print("-" * 80)
 
+def calculate_combined_metrics(*model_dfs):
+    """
+    Calculate CO₂ reduction metrics and MSE for all models.
+    """
+    metrics = ['waiting_time', 'queue_length', 'travel_time']
+    model_metrics = []
+    
+    # Get fixed timing baseline
+    fixed_df = next(df for df in model_dfs if df['model_type'].iloc[0] == 'fixed')
+    fixed_means = {metric: fixed_df[metric].rolling(30).mean().mean() for metric in metrics}
+    
+    print("\n=== CO₂ Reduction Calculation Details ===")
+    print("\nBaseline (Fixed Timing) Metrics:")
+    for metric in metrics:
+        print(f"{metric.replace('_', ' ').title()}: {fixed_means[metric]:.2f}")
+    print("\nImprovement Calculation Formula:")
+    print("For each metric: Improvement = -((fixed_mean - model_mean) / fixed_mean * 100)")
+    print("Positive values indicate better performance than fixed timing")
+    print("\nCO₂ Reduction Formula:")
+    print("CO₂_reduction (%) = 0.5 × TravelTime_reduction (%) + 0.5 × WaitingTime_reduction (%) + 0.1 × QueueLength_reduction (%)")
+    print("-" * 80)
+    
+    # Calculate metrics for each model
+    for df in model_dfs:
+        if df['model_type'].iloc[0] == 'fixed':
+            continue
+            
+        model_name = df['model_type'].iloc[0].upper()
+        
+        # Calculate individual metric improvements
+        improvements = []
+        for metric in metrics:
+            model_mean = df[metric].rolling(30).mean().mean()
+            fixed_mean = fixed_means[metric]
+            improvement = -((fixed_mean - model_mean) / fixed_mean * 100) if fixed_mean != 0 else 0
+            improvements.append(improvement)
+        
+        # Calculate CO₂ reduction metric
+        co2_reduction = (
+            improvements[2] * 0.5 +  # travel time (50%)
+            improvements[0] * 0.5 +  # waiting time (50%)
+            improvements[1] * 0.1    # queue length (10%)
+        )
+        
+        # Calculate MSE (divided by 10)
+        mse = np.mean((df['predictions'] - df['actual_flows'])**2) / 10
+        
+        model_metrics.append({
+            'Model': model_name,
+            'CO₂ Reduction (%)': f"{co2_reduction:.2f}%",
+            'Waiting Time Reduction (%)': f"{improvements[0]:.2f}%",
+            'Queue Length Reduction (%)': f"{improvements[1]:.2f}%",
+            'Travel Time Reduction (%)': f"{improvements[2]:.2f}%",
+            'MSE': f"{mse:.2f}"
+        })
+    
+    # Sort models by CO₂ reduction
+    model_metrics.sort(key=lambda x: float(x['CO₂ Reduction (%)'].strip('%')), reverse=True)
+    
+    print("\n=== Final Model Rankings ===")
+    print("\nModels ranked by CO₂ reduction:")
+    print("(Higher values indicate better environmental performance)")
+    print("-" * 100)
+    print(pd.DataFrame(model_metrics).to_markdown(index=False, tablefmt="grid"))
+    print("-" * 100)
+
 def main_menu():
     models = ['arima', 'lstm', 'bilstm', 'gru', 'bigru', 'fixed']
     
@@ -595,9 +810,10 @@ def main_menu():
         print("1. Run all simulations (ARIMA, LSTM, BiLSTM, GRU, BiGRU, Fixed)")
         print("2. Generate visualizations from existing data")
         print("3. Print performance metrics")
-        print("4. Exit")
+        print("4. Print combined metrics with calculation details")
+        print("5. Exit")
         
-        choice = input("Enter choice (1-4): ")
+        choice = input("Enter choice (1-5): ")
         
         if choice == '1':
             print("\nInitializing simulations...")
@@ -622,15 +838,6 @@ def main_menu():
                     data['arima'], data['lstm'], data['bilstm'],
                     data['gru'], data['bigru'], data['fixed']
                 )
-                
-                for model in models:
-                    if model != 'fixed':
-                        create_prediction_accuracy_plot(
-                            data[model]['predictions'],
-                            data[model]['actual_flows'],
-                            f'Generated Visualizations/{model}_predictions.png'
-                        )
-                
                 print("Visualizations saved in 'Generated Visualizations' folder")
             
             except Exception as e:
@@ -645,11 +852,19 @@ def main_menu():
                 print(f"Metric calculation error: {str(e)}")
         
         elif choice == '4':
+            print("\nCalculating combined metrics with detailed calculations...")
+            try:
+                data = [pd.read_csv(f'Model Data/{model}_results.csv') for model in models]
+                calculate_combined_metrics(*data)
+            except Exception as e:
+                print(f"Combined metric calculation error: {str(e)}")
+        
+        elif choice == '5':
             print("Exiting program...")
             break
         
         else:
-            print("Invalid choice. Please enter 1-4.")
+            print("Invalid choice. Please enter 1-5.")
 
 if __name__ == '__main__':
     # Create necessary directories

@@ -42,6 +42,9 @@ Traffic-Simulation-using-RNN-Variants/
 ├── osm.view.xml                        # SUMO visualization view settings
 │
 ├── simulation_run.py                   # Main Python script to run and control simulation
+│
+├── Intelligent Adaptive Traffic Control A Comparative Study of RNN Variants.pdf                   # Research Paper
+
 ```
 
 ---

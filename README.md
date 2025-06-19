@@ -95,7 +95,7 @@ Traffic-Simulation-using-RNN-Variants/
 
 ## ▶️ How to Run
 
-1. **Install requirements** (create a `requirements.txt` if needed):
+1. **Install requirements**
    ```bash
    pip install -r requirements.txt
    ```
@@ -163,6 +163,6 @@ This project is open for academic and research use. Please contact the authors i
 
 ## 🔗 References
 
-Please refer to the `Final Practicum Report` or the [References](#) section for cited works.
+Please refer to the `Intelligent Adaptive Traffic Control A Comparative Study of RNN Variants.pdf`,  the [References](#) section for cited works.
 
 ---
